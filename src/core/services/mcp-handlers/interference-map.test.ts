@@ -1084,3 +1084,203 @@ describe('round-2 — CRLF parsing (C1) + honest caveats (M-A, FINDING 2)', () =
     expect(map.caveats.some(c => /read against the LOCAL base/i.test(c))).toBe(false);
   });
 });
+
+describe('InFlightConflictsCarryATextualMergeVerdict (add-merge-tree-conflict-oracle)', () => {
+  const TIP_X = 'a'.repeat(40);
+  const TIP_Y = 'b'.repeat(40);
+  const wawPair = (tips: { x?: string; y?: string }) => [
+    change({
+      ref: 'feat-x', actor: 'Alice', repo: 'this-repo', kind: 'branch', ...(tips.x ? { tip: tips.x } : {}),
+      files: [{ path: 'a.ts', status: 'modified', hunks: [modifyHunk(4, 3)] }],
+      baseSymbolsByFile: new Map([['a.ts', [baseSym('a.ts::foo', 1, 10)]]]),
+    }),
+    change({
+      ref: 'feat-y', actor: 'Bob', repo: 'this-repo', kind: 'branch', ...(tips.y ? { tip: tips.y } : {}),
+      files: [{ path: 'a.ts', status: 'modified', hunks: [modifyHunk(6, 2)] }],
+      baseSymbolsByFile: new Map([['a.ts', [baseSym('a.ts::foo', 1, 10)]]]),
+    }),
+  ];
+  const withMerge = (branches: RawChange[], simulateMerge: InFlightProviders['simulateMerge']): InFlightProviders =>
+    ({ ...providers({ branchesByRepo: { 'this-repo': branches } }), simulateMerge });
+
+  it('keeps a WAW hazard and annotates a disjoint edit as clean-automerge', async () => {
+    const sim = vi.fn(async () => ({ verdict: 'clean-automerge' as const }));
+    const map = await run({ directory: '/p', includePullRequests: false }, withMerge(wawPair({ x: TIP_X, y: TIP_Y }), sim));
+    expect(sim).toHaveBeenCalledWith('/p', TIP_X, TIP_Y, { deadline: expect.any(Number) });
+    expect(map.conflicts[0]).toMatchObject({ hazard: 'WAW', textualMerge: { verdict: 'clean-automerge' } });
+    expect(map.conflicts[0].suggestion).toMatch(/merges the text cleanly/i);
+    expect(map.findingCount).toBe(1);
+    expect(map.textualConflictCount).toBe(0);
+    expect(map.caveats.some(c => /merge-tree.*no merge driver of this repository runs/i.test(c))).toBe(true);
+  });
+
+  it('annotates same-line edits as textual-conflict, names the files, and counts them in the headline', async () => {
+    const sim = async () => ({ verdict: 'textual-conflict' as const, conflictedFiles: ['a.ts'] });
+    const map = await run({ directory: '/p', includePullRequests: false }, withMerge(wawPair({ x: TIP_X, y: TIP_Y }), sim));
+    expect(map.conflicts[0].textualMerge).toEqual({ verdict: 'textual-conflict', conflictedFiles: ['a.ts'] });
+    expect(map.conflicts[0].suggestion).toMatch(/textual merge conflict in a\.ts/i);
+    expect(map.textualConflictCount).toBe(1);
+    expect(map.headline).toMatch(/1 textual merge conflict/);
+  });
+
+  it('does not call a shared append "safe in either order" when git reports a textual conflict', async () => {
+    const reg = (ref: string, tip: string) => change({
+      ref, actor: ref, repo: 'this-repo', kind: 'branch', tip,
+      files: [{ path: 'reg.ts', status: 'modified', hunks: [appendHunk(20)] }],
+      baseSymbolsByFile: new Map([['reg.ts', [baseSym('reg.ts::REGISTRY', 10, 50)]]]),
+    });
+    const map = await run(
+      { directory: '/p', includePullRequests: false },
+      withMerge([reg('pr-a', TIP_X), reg('pr-b', TIP_Y)], async () => ({ verdict: 'textual-conflict' as const, conflictedFiles: ['reg.ts'] })),
+    );
+    expect(map.conflicts[0].hazard).toBe('shared-append');
+    expect(map.conflicts[0].suggestion).not.toMatch(/safe to land/i);
+    expect(map.conflicts[0].suggestion).toMatch(/textual merge conflict in reg\.ts/i);
+  });
+
+  it('is not-assessed, never clean, when a tip is missing or one side is an agent task', async () => {
+    const sim = vi.fn(async () => ({ verdict: 'clean-automerge' as const }));
+    const noTip = await run({ directory: '/p', includePullRequests: false }, withMerge(wawPair({ x: TIP_X }), sim));
+    expect(noTip.conflicts[0].textualMerge).toMatchObject({ verdict: 'not-assessed', detail: expect.stringMatching(/feat-y has no local tip/) });
+    const task = await run(
+      { directory: '/p', includePullRequests: false, tasks: [{ id: 'agent-1', seedSymbols: ['a.ts::foo'] }] },
+      withMerge([wawPair({ x: TIP_X })[0]], sim),
+    );
+    expect(task.conflicts[0].textualMerge).toMatchObject({ verdict: 'not-assessed', detail: expect.stringMatching(/agent task with no commit/) });
+    expect(sim).not.toHaveBeenCalled();
+  });
+
+  it('turns a failed or unresolvable simulation into not-assessed', async () => {
+    const rejected = await run(
+      { directory: '/p', includePullRequests: false },
+      withMerge(wawPair({ x: TIP_X, y: TIP_Y }), async () => { throw new Error('boom'); }),
+    );
+    expect(rejected.conflicts[0].textualMerge).toEqual({ verdict: 'not-assessed', detail: 'boom' });
+  });
+
+  it('does not simulate a cross-repository pair (no shared history)', async () => {
+    vi.mocked(handleSpecStoreStatus).mockResolvedValue({
+      bound: true, targets: [{ name: 'other', resolved: true, state: 'indexed', path: '/other' }],
+    } as never);
+    const sharedGraph = graph([node({ id: 'a.ts::foo', startLine: 1, endLine: 10, stableId: 'S1' })]);
+    vi.mocked(readCachedContext).mockResolvedValue({ callGraph: sharedGraph } as never);
+    const [x, y] = wawPair({ x: TIP_X, y: TIP_Y });
+    const stable = new Map([['a.ts', [baseSym('a.ts::foo', 1, 10, 'S1')]]]);
+    const sim = vi.fn(async () => ({ verdict: 'clean-automerge' as const }));
+    const map = await run(
+      { directory: '/p', includePullRequests: false, federation: true },
+      { ...providers({ branchesByRepo: { 'this-repo': [{ ...x, baseSymbolsByFile: stable }], other: [{ ...y, repo: 'other', baseSymbolsByFile: stable }] } }), simulateMerge: sim },
+    );
+    const cross = map.conflicts.find(c => c.crossRepo);
+    expect(cross?.textualMerge).toMatchObject({ verdict: 'not-assessed', detail: expect.stringMatching(/different repositories/) });
+    expect(sim).not.toHaveBeenCalled();
+  });
+
+  it('bounds the simulations per call and discloses the rest as not assessed', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => change({
+      ref: `b${String(i).padStart(2, '0')}`, actor: 'x', repo: 'this-repo', kind: 'branch', tip: String(i % 10).repeat(40),
+      files: [{ path: 'a.ts', status: 'modified', hunks: [modifyHunk(4, 1)] }],
+      baseSymbolsByFile: new Map([['a.ts', [baseSym('a.ts::foo', 1, 10)]]]),
+    }));
+    const sim = vi.fn(async () => ({ verdict: 'clean-automerge' as const }));
+    const map = await run({ directory: '/p', includePullRequests: false }, withMerge(many, sim));
+    expect(map.conflictCount).toBe(66);
+    expect(sim).toHaveBeenCalledTimes(60);
+    expect(map.conflicts.filter(c => c.textualMerge.verdict === 'not-assessed')).toHaveLength(6);
+    expect(map.caveats.some(c => /6 conflict pair\(s\) were not merge-simulated/.test(c))).toBe(true);
+  });
+
+  it('carries a branch tip and a locally present PR head commit into the raw change', async () => {
+    const oid = 'c'.repeat(40);
+    const branchGit = async (_p: string, args: string[]): Promise<string> => {
+      if (args[0] === 'for-each-ref') return 'main\nfeature\n';
+      if (args[0] === 'merge-base') return 'abc123\n';
+      if (args[0] === 'rev-parse' && args.at(-1) === 'feature') return `${oid}\n`;
+      if (args[0] === 'rev-parse') return 'main\n';
+      if (args[0] === 'diff') return 'diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -1 +1 @@\n-a\n+b\n';
+      return '';
+    };
+    const branches = await defaultEnumerateBranches('/repo', 'this-repo', 'main', undefined, branchGit);
+    expect((Array.isArray(branches) ? branches : branches.changes)[0].tip).toBe(oid);
+
+    const patch = 'diff --git a/n.md b/n.md\n--- a/n.md\n+++ b/n.md\n@@ -1 +1 @@\n-a\n+b\n';
+    const listWith = (headRefOid: string) => JSON.stringify([{ number: 7, headRefName: 'f', headRefOid, title: 't' }]);
+    const gh = (headRefOid: string) => async (_p: string, args: string[]) => (args[1] === 'list' ? listWith(headRefOid) : patch);
+    const present = await defaultEnumeratePullRequests('/repo', 'this-repo', 'main', gh(oid), async () => 'main\n');
+    expect(present.changes[0].tip).toBe(oid);
+    const absentGit = async (_p: string, args: string[]) => { if (args[0] === 'cat-file') throw new Error('missing'); return 'main\n'; };
+    const absent = await defaultEnumeratePullRequests('/repo', 'this-repo', 'main', gh(oid), absentGit);
+    expect(absent.changes[0].tip).toBeUndefined();
+    const forged = await defaultEnumeratePullRequests('/repo', 'this-repo', 'main', gh('--output=/tmp/x'), async () => 'main\n');
+    expect(forged.changes[0].tip).toBeUndefined();
+  });
+});
+
+describe('textual merge verdict — determinism, time budget, and response size', () => {
+  const pairOf = (n: number, path = 'a.ts') => Array.from({ length: n }, (_, i) => change({
+    ref: `b${String(i).padStart(2, '0')}`, actor: 'x', repo: 'this-repo', kind: 'branch', tip: String(i % 10).repeat(40),
+    files: [{ path, status: 'modified', hunks: [modifyHunk(4, 1)] }],
+    baseSymbolsByFile: new Map([[path, [baseSym(`${path}::foo`, 1, 10)]]]),
+  }));
+
+  it('simulates the same capped pairs in the same order on every call', async () => {
+    const calls: string[][] = [[], []];
+    for (const k of [0, 1]) {
+      const branches = pairOf(12);
+      await run(
+        { directory: '/p', includePullRequests: false },
+        { ...providers({ branchesByRepo: { 'this-repo': branches } }), simulateMerge: async (_r, a, b) => { calls[k].push([a, b].sort().join('+')); return { verdict: 'clean-automerge' }; } },
+      );
+    }
+    expect(calls[0]).toHaveLength(60);
+    expect(calls[1]).toEqual(calls[0]);
+  });
+
+  it('marks pairs past the wall-clock budget as not assessed, with a caveat', async () => {
+    let now = 1_000_000;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const map = await run(
+        { directory: '/p', includePullRequests: false },
+        { ...providers({ branchesByRepo: { 'this-repo': pairOf(3) } }), simulateMerge: async (_r, _a, _b, options) => { expect(options?.deadline).toBe(1_020_000); now += 21_000; return { verdict: 'clean-automerge' }; } },
+      );
+      expect(map.conflicts.filter(c => c.textualMerge.verdict === 'clean-automerge')).toHaveLength(1);
+      expect(map.conflicts.filter(c => /20-second merge simulation budget/.test(c.textualMerge.detail ?? ''))).toHaveLength(2);
+      expect(map.caveats.some(c => /2 conflict pair\(s\) were not merge-simulated because the 20-second/.test(c))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('stays under the response budget with long paths and many conflicted files', async () => {
+    const longPath = `${'p'.repeat(1_000)}.ts`;
+    const branches = pairOf(40, longPath).map((c, i) => ({ ...c, ref: `${'r'.repeat(240)}${i}`, actor: 'a'.repeat(200) }));
+    const files = Array.from({ length: 50 }, (_, i) => `${'q'.repeat(239)}${i}`);
+    const map = await run(
+      { directory: '/p', includePullRequests: false },
+      { ...providers({ branchesByRepo: { 'this-repo': branches } }), simulateMerge: async () => ({ verdict: 'textual-conflict', conflictedFiles: files.slice(0, 8) }) },
+    );
+    expect(map.conflictCount).toBe(780);
+    expect(Buffer.byteLength(JSON.stringify(map))).toBeLessThanOrEqual(200 * 1024);
+    expect(map.conflictsTruncated).toBe(true);
+    expect(map.truncationNote).toBeDefined();
+  });
+});
+
+describe('response bound keeps evidence when nodes alone are large', () => {
+  it('caps node details and does not drop conflicts that cannot make the map fit', async () => {
+    const failed = Array.from({ length: 38 }, (_, i) => change({
+      ref: `broken-${i}`, actor: 'x', repo: 'this-repo', kind: 'branch', fetchError: 'e'.repeat(8_000),
+    }));
+    const pair = ['p1', 'p2'].map(ref => change({
+      ref, actor: 'x', repo: 'this-repo', kind: 'branch',
+      files: [{ path: 'a.ts', status: 'modified', hunks: [modifyHunk(4, 1)] }],
+      baseSymbolsByFile: new Map([['a.ts', [baseSym('a.ts::foo', 1, 10)]]]),
+    }));
+    const map = await run({ directory: '/p', includePullRequests: false }, providers({ branchesByRepo: { 'this-repo': [...pair, ...failed] } }));
+    expect(map.conflictCount).toBe(1);
+    expect(map.conflicts).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(map))).toBeLessThanOrEqual(200 * 1024);
+    expect(map.changes.every(c => (c.detail?.length ?? 0) <= 501)).toBe(true);
+  });
+});
