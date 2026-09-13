@@ -1014,7 +1014,13 @@ Respond in JSON:
   /**
    * Parse requirements from a spec's markdown content.
    * Returns an array of { name, description } extracted from
-   * "### Requirement: Name\n\nThe system SHALL ..." blocks.
+   * "### Requirement: Name\n\nThe system SHALL ..." blocks — the level OpenSpec itself counts.
+   *
+   * The description is the first line of NORMATIVE text. Provenance lines are skipped — an
+   * implementation anchor and its continuation lines, and a provenance blockquote such as
+   * `> Decision recorded:` — so a requirement whose anchor precedes its text is not described by the
+   * anchor. A blockquote that carries normative text is still the description
+   * (change: ground-generated-specs-in-the-graph).
    */
   private parseSpecRequirements(specContent: string): Array<{ name: string; description: string }> {
     const requirements: Array<{ name: string; description: string }> = [];
@@ -1024,11 +1030,23 @@ Respond in JSON:
       const m = lines[i].match(/^###\s+Requirement:\s+(.+)/i);
       if (!m) continue;
       const name = m[1].trim();
-      // Look ahead for the description line (first non-empty line after the heading)
       let description = '';
-      for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+      let afterAnchor = false;
+      for (let j = i + 1; j < Math.min(i + 20, lines.length); j++) {
         const l = lines[j].trim();
-        if (l.length > 0) { description = l; break; }
+        if (l.length === 0) continue;
+        if (/^#{1,6}\s/.test(l)) break;
+        // An implementation anchor item, and the backtick-only lines that continue it — only directly
+        // after the anchor, so a normative line that is just a code span is still the description.
+        if (/^[-*]?\s*\*\*Implementation\*\*:/.test(l)) { afterAnchor = true; continue; }
+        if (afterAnchor && /^[-*]?\s*(?:`[^`]+`[\s,]*)+$/.test(l)) continue;
+        afterAnchor = false;
+        // A provenance blockquote names its label with a colon, or is a bare code span; a blockquote
+        // carrying normative prose is the description.
+        if (/^>\s*(?:Decision recorded|Date|Implementation|Implements|Source files?):/i.test(l)
+          || /^>\s*`[^`]+`\s*$/.test(l)) continue;
+        description = l;
+        break;
       }
       if (name) requirements.push({ name, description });
     }

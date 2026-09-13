@@ -359,6 +359,54 @@ describe('buildSpecLinkIndex', () => {
 // PROVENANCE AND COMPATIBILITY
 // ============================================================================
 
+describe('sub-component requirements and unassessable citations (change: ground-generated-specs-in-the-graph)', () => {
+  it('does not count a #### sub-component heading as a requirement, as OpenSpec does not', () => {
+    const content = `# Domain\n\n### Requirement: Top\n\nThe system SHALL top.\n\n- **Implementation**: \`top::src/a.ts\`\n\n## Sub-components\n\n### Sub-component: Part\n\n#### Requirement: Nested\n\nThe system SHALL nest.\n`;
+    expect(parseRequirementBlocks(content).map(b => b.name)).toEqual(['Top']);
+  });
+
+  it('round-trips an index carrying not-assessed through the persisted artifact reader', () => {
+    const index = buildSpecLinkIndex({
+      specs: specInput(spec('RunsJob', ['Run::src/job.go'])),
+      graph: graph(node('src/a.ts', [{ name: 'other' }])),
+      analysisGeneration: 'gen-1',
+      assessFile: () => 'language-not-extracted',
+      now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    expect(readMappingArtifact(JSON.stringify(index)).kind).toBe('link-index');
+  });
+
+  it('reports an absent symbol in an unassessable file as not-assessed with its boundary, never stale', () => {
+    const index = buildSpecLinkIndex({
+      specs: specInput(spec('RunsJob', ['Run::src/job.go'])),
+      graph: graph(node('src/a.ts', [{ name: 'other' }])),
+      analysisGeneration: 'gen-1',
+      assessFile: file => (file.endsWith('.go') ? 'language-not-extracted' : undefined),
+      now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    const link = index.links[0];
+    expect(link.state).toBe('not-assessed');
+    expect(link.anchors[0]).toMatchObject({ state: 'not-assessed', boundary: 'language-not-extracted' });
+    expect(index.stats).toMatchObject({ notAssessed: 1, stale: 0 });
+  });
+
+  it('keeps a path-free absent anchor stale, and ranks stale above not-assessed', () => {
+    const assessFile = (file: string) => (file.endsWith('.go') ? 'language-not-extracted' : undefined);
+    const make = (anchors: string[]) => buildSpecLinkIndex({
+      specs: specInput(spec('R', anchors)), graph: graph(node('src/a.ts', [{ name: 'other' }])),
+      analysisGeneration: 'gen-1', assessFile, now: () => new Date('2026-01-01T00:00:00.000Z'),
+    });
+    expect(make(['gone']).links[0].state).toBe('stale');
+    expect(make(['Run::src/job.go', 'gone::src/a.ts']).links[0].state).toBe('stale');
+  });
+
+  it('without an assessor every absent symbol is stale, as before', () => {
+    const index = build(specInput(spec('R', ['Run::src/job.go'])), graph(node('src/a.ts', [{ name: 'other' }])));
+    expect(index.links[0].state).toBe('stale');
+    expect(index.stats.notAssessed).toBe(0);
+  });
+});
+
 describe('specCorpusDigest', () => {
   it('is stable under input ordering', () => {
     const specs: SpecLinkIndexSpecInput[] = [

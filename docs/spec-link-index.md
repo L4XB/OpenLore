@@ -121,3 +121,27 @@ are consumed automatically when their confidence is `reviewed` or `llm`. Lower-c
 semantic or heuristic hints remain file-footprint evidence only. Run
 `openlore mapping refresh` to see the bounded list of requirements that still need an
 exact `symbol::path` anchor; refresh never guesses a replacement for a stale anchor.
+
+
+## Unassessable citations
+
+The generator writes each anchor **below** the requirement's `The system SHALL …` line, so the
+verifier's description is the normative text rather than the anchor. Requirements are indexed at the
+`### Requirement:` level only — the level OpenSpec counts.
+
+A cited symbol that is absent from the export inventory is `stale` only where that absence is
+evidence. When the cited file is one the analysis cannot vouch for, the anchor and its requirement
+are `not-assessed`, with the boundary named:
+
+| Boundary | Meaning |
+|---|---|
+| `language-not-extracted` | exports are never extracted for the file's language (only TS/JS, Python and Java are) |
+| `file-not-analyzed` | the file exists but the analysis did not cover it |
+
+A boundary is named only for a file that is analyzed or exists as a regular file, resolved to its real
+path; an anchor with no file, or naming a file that exists nowhere, stays `stale`. `not-assessed`
+requirements are counted in `stats.notAssessed`, listed by `openlore mapping refresh`, and never
+reported as orphans. A cached `mapping.json` is re-assessed before it is served, because the working tree is
+not part of its key. Parse health is not a boundary: it records tree-sitter regions, and exports
+come from the import parser. The artifact schema is version 7 (change:
+`ground-generated-specs-in-the-graph`).

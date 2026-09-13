@@ -210,6 +210,16 @@ re-derives rebuilt callers. Three rounds of four adversarial reviews re-scoped i
 receivers (`this["m"]()`, `getattr(self, "m")()`) were built and then removed because the class graph
 cannot bound the receiver type soundly, and container resolution and Python dicts stay disclosed.
 
+Shipped and archived since: `ground-generated-specs-in-the-graph` (2026-09-12, narrowed) — a pre-build
+evidence audit found most of it superseded by the shipped deterministic spec link index, so it closes
+the defects that remained: generated anchors are written below the normative text (the verifier no
+longer describes a requirement by its anchor), requirements sharing an anchor key must agree or get
+no anchor, and an anchor whose symbol is absent from a file the analysis cannot vouch for is
+`not-assessed` with a named boundary (`language-not-extracted`, `file-not-analyzed`) instead of a false
+`stale`, matched by the file's real spelling and re-assessed before a cached index is served. Two
+review rounds withdrew `#### Requirement:` recovery (OpenSpec counts only `###`) and a parse-health
+boundary (wrong extractor's evidence).
+
 ## Maintenance rules (what kept this table honest)
 
 - Ship a `change: <name>` marker in the code, or expect this table to call the change unbuilt.
