@@ -9,6 +9,7 @@
  * `tested_by`, inheritance).
  *
  * change: fix-test-selection-soundness
+ * change: add-test-selection-safeguard-tiers
  *
  * Soundness is stated honestly: this is an OVER-APPROXIMATE PRIORITIZER, not a
  * sound replacement for the full suite. Direct/static dispatch is safely
@@ -20,7 +21,12 @@ import { resolveFederationScope, findCrossRepoTests } from '../../federation/res
 import { loadTraversalIndex } from './traversal.js';
 import type { SerializedCallGraph, FunctionNode } from '../../analyzer/call-graph.js';
 import { SUBGRAPH_MAX_DEPTH_LIMIT } from '../../../constants.js';
-import { assembleBoundary, computeStaleness, edgeBasisWithinSet } from './confidence-boundary.js';
+import { assembleBoundary, buildPairEdgeIndex, computeStaleness, edgeBasisWithinSet } from './confidence-boundary.js';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { isTestFile } from '../../analyzer/test-file.js';
+import { gitPathArgs } from '../../../utils/git-args.js';
+import { execFileGit } from '../../../utils/git-exec.js';
 import {
   loadDynamicBoundaryReport,
   dynamicBoundaryCrossing,
@@ -53,11 +59,50 @@ export interface SelectTestsInput {
 type Confidence = 'high' | 'medium' | 'low';
 const CONF_RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
 
+/**
+ * Why a test was selected (change: add-test-selection-safeguard-tiers). The always-select tiers are
+ * git facts that do not depend on the graph reaching anything; they outrank reachability because
+ * missing them is unrecoverable — the test the user just edited or added is exactly the one to run.
+ */
+export const SELECTION_REASON = {
+  newTest: 'included: new test',
+  changedTest: 'included: test file itself changed',
+  reaches: (depth: number) => `included: reaches changed symbol at depth ${depth}`,
+  sameFile: 'included: tests a function in the same file as a changed symbol',
+} as const;
+
+/** Reason strength: a lower number is the stronger, tier-first receipt. */
+function reasonRank(reason: string): number {
+  if (reason === SELECTION_REASON.newTest) return 0;
+  if (reason === SELECTION_REASON.changedTest) return 1;
+  if (reason === SELECTION_REASON.sameFile) return 3;
+  return 2;
+}
+
+/** Tier first, then the shallower reaching depth (numerically — "depth 10" is weaker than "depth 2"). */
+function compareReasons(a: string, b: string): number {
+  const depth = (reason: string) => Number(/depth (\d+)$/.exec(reason)?.[1] ?? 0);
+  return reasonRank(a) - reasonRank(b) || depth(a) - depth(b) || a.localeCompare(b);
+}
+
+/** A whole test file selected by a tier before the analysis indexed any test in it. */
+const WHOLE_FILE_TEST = '*';
+
 interface SelectedTest {
   test: string;
   file: string;
   viaPath: string[];
   confidence: Confidence;
+  /** The strongest reason this test was selected. */
+  reason: string;
+  /** Every other reason that also selected it, strongest first. */
+  alsoIncludedBecause?: string[];
+  /**
+   * The reaching path crosses synthesized (heuristically recovered) edges: how many, and the rules
+   * that produced them. Absent when the path rests on direct resolution only, or the test was selected
+   * by a tier rather than a path. Existing provenance labels only — no score.
+   */
+  structuralBasis?: { synthesizedEdges: number; synthesizedBy: string[] };
 }
 
 /** Resolve changed symbols → seed production nodes (exact name preferred). */
@@ -188,6 +233,12 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
   let seeds: FunctionNode[];
   let widenedSymbolResolutions: SymbolSeedResolution['widened'] = [];
   let changedFiles: string[] = [];
+  /** Test files the diff touched, by tier, relative to the analyzed directory (change: add-test-selection-safeguard-tiers). */
+  const tierFiles: Array<{ file: string; reason: string }> = [];
+  /** `false` when untracked files could not be listed, so a brand-new untracked test may be missing. */
+  let untrackedAssessed = true;
+  /** Untracked test files past {@link MAX_UNTRACKED_TIER_FILES}, disclosed rather than dropped silently. */
+  let untrackedOmitted = 0;
   if (hasSymbols) {
     const resolution = resolveSymbolSeeds(cg, input.changedSymbols!);
     seeds = resolution.seeds;
@@ -198,12 +249,39 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
       const diff = await getChangedFiles({ rootPath: absDir, baseRef, includeUnstaged: true });
       changedFiles = diff.files.map(f => f.path);
       seeds = seedsFromFiles(cg, changedFiles);
+      // A test file the diff touched, or a new untracked one, is selected on its own standing — not
+      // only if reachability happens to reach it. Only a file the analyzer's own rule calls a test, inside
+      // the analyzed directory, and still on disk: a fixture under `test/`, another package's test, or a
+      // test deleted in the working tree has nothing to run here.
+      const prefix = await gitPrefix(absDir);
+      const tierFileSet = new Set<string>();
+      for (const f of diff.files) {
+        if (f.status === 'deleted') continue;
+        // The test rule is applied in the analyzed directory's frame, as the analyzer applies it: under
+        // an analyzed `tests/app/`, `src/util.ts` is production code.
+        const local = localPath(f.path, prefix);
+        if (!local || !isTestFile(local) || tierFileSet.has(local) || !existsSync(join(absDir, local))) continue;
+        tierFileSet.add(local);
+        tierFiles.push({ file: local, reason: f.status === 'added' ? SELECTION_REASON.newTest : SELECTION_REASON.changedTest });
+      }
+      const untracked = await untrackedTestFiles(absDir);
+      if (untracked === null) untrackedAssessed = false;
+      // A path with control characters is not a test anyone wrote on purpose, and one that is not on
+      // disk under the analyzed directory (a planted `core.worktree`) is not this repository's.
+      const untrackedTests = (untracked ?? []).filter(file =>
+        !tierFileSet.has(file) && !hasControlCharacter(file) && existsSync(join(absDir, file)));
+      untrackedOmitted = Math.max(0, untrackedTests.length - MAX_UNTRACKED_TIER_FILES);
+      for (const file of untrackedTests.slice(0, MAX_UNTRACKED_TIER_FILES)) {
+        tierFileSet.add(file);
+        changedFiles.push((prefix ?? '') + file);
+        tierFiles.push({ file, reason: SELECTION_REASON.newTest });
+      }
     } catch (err) {
       return { error: `git diff failed (base ${baseRef}): ${err instanceof Error ? err.message : String(err)}` };
     }
   }
 
-  if (seeds.length === 0) {
+  if (seeds.length === 0 && tierFiles.length === 0) {
     // Honesty: if federation was opted into, say why no cross-repo selection ran
     // rather than silently omitting the federation block an active scope implies.
     const federationRequested = input.federation === true || (input.federationRepos?.length ?? 0) > 0;
@@ -215,8 +293,12 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
         : `No changed production functions vs ${baseRef}${defaultedToHead ? ' (defaulted — no changedSymbols or diffRef was given)' : ''}. Nothing has changed, the diff touches only non-code files, or analyze_codebase is stale.`,
       ...(defaultedToHead ? { note: 'Called without changedSymbols/diffRef — diffed the working tree against HEAD. Pass changedSymbols or diffRef to target a specific change.' } : {}),
       ...(federationRequested ? { federationNote: 'Federation scope was requested, but no changed production symbol resolved in the home repo — cross-repo test selection keys off the home repo\'s changed published symbols, so nothing was propagated. Pass changedSymbols (or a diffRef with code changes) to select across the fleet.' } : {}),
-      soundness: { posture: 'over-approximate', caveats: ['No seeds resolved — nothing to select.'] },
+      soundness: {
+        posture: 'over-approximate',
+        caveats: ['No seeds resolved — nothing to select.', ...(untrackedAssessed ? [] : [UNTRACKED_NOT_ASSESSED])],
+      },
       coverage: { languages: [], testDetection: 'none' as const },
+      flakiness: FLAKINESS_NOT_ASSESSED,
       confidenceBoundary: assembleBoundary({ staleness: await computeStaleness(absDir), integrity: ctx?.integrity }),
     };
   }
@@ -241,6 +323,20 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
     depth === maxDepth && traversal.neighborIds(id, 'backward', traversalFilter).some(neighbor => !depthOf.has(neighbor)),
   ) ? maxDepth : undefined;
 
+  // Id path from a reached node down to its seed: [node, …, changedFn].
+  const idPathToSeed = (id: string): string[] => {
+    const ids: string[] = [];
+    let cur: string | undefined = id;
+    const guard = new Set<string>();
+    while (cur !== undefined && !guard.has(cur)) {
+      guard.add(cur);
+      ids.push(cur);
+      if (depthOf.get(cur) === 0) break;
+      cur = parent.get(cur);
+    }
+    return ids;
+  };
+
   // Path from a reached node down to its seed: [node, …, changedFn].
   const pathToSeed = (id: string): string[] => {
     const names: string[] = [];
@@ -256,33 +352,101 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
   };
 
   const byTest = new Map<string, SelectedTest>();
-  const add = (file: string, name: string, viaPath: string[], confidence: Confidence) => {
+  const reasonsByTest = new Map<string, Set<string>>();
+  const pairEdges = buildPairEdgeIndex(cg.edges);
+  // The backward walk also crosses `tested_by` associations (production → test), so a reached id path
+  // can run through a test that is not a caller at all. Such a path is not a reaching path.
+  const testedByOnlyPairs = new Set<string>();
+  for (const e of cg.edges) if (e.kind === 'tested_by') testedByOnlyPairs.add(e.callerId + '\x00' + e.calleeId);
+  for (const e of cg.edges) if (e.kind !== 'tested_by') testedByOnlyPairs.delete(e.callerId + '\x00' + e.calleeId);
+  const crossesTestedBy = (ids: string[]): boolean =>
+    testedByOnlyPairs.size > 0 && ids.some((id, i) => i + 1 < ids.length && testedByOnlyPairs.has(id + '\x00' + ids[i + 1]));
+  /** The synthesized edges on a reaching id path `[caller, …, seed]`, by the pair index (direct wins). */
+  const basisOfPath = (ids: string[]): SelectedTest['structuralBasis'] => {
+    let synthesizedEdges = 0;
+    const rules = new Set<string>();
+    for (let i = 0; i + 1 < ids.length; i++) {
+      const edge = pairEdges.get(ids[i] + '\x00' + ids[i + 1]);
+      if (edge?.confidence !== 'synthesized') continue;
+      synthesizedEdges++;
+      rules.add(edge.synthesizedBy ?? 'synthesized');
+    }
+    return synthesizedEdges > 0 ? { synthesizedEdges, synthesizedBy: [...rules].sort() } : undefined;
+  };
+  /** A path basis extended by one more hop that is not on the id path (the `tested_by` edge itself). */
+  const withEdgeBasis = (basis: SelectedTest['structuralBasis'], edge: SerializedCallGraph['edges'][number]): SelectedTest['structuralBasis'] => {
+    if (edge.confidence !== 'synthesized') return basis;
+    const rules = new Set(basis?.synthesizedBy ?? []);
+    rules.add(edge.synthesizedBy ?? 'synthesized');
+    return { synthesizedEdges: (basis?.synthesizedEdges ?? 0) + 1, synthesizedBy: [...rules].sort() };
+  };
+  const add = (
+    file: string,
+    name: string,
+    viaPath: string[],
+    confidence: Confidence,
+    reason: string,
+    structuralBasis?: SelectedTest['structuralBasis'],
+  ) => {
     const key = testKey(file, name);
+    (reasonsByTest.get(key) ?? reasonsByTest.set(key, new Set()).get(key)!).add(reason);
     const existing = byTest.get(key);
     if (!existing || CONF_RANK[confidence] > CONF_RANK[existing.confidence] ||
         (CONF_RANK[confidence] === CONF_RANK[existing.confidence] && viaPath.length < existing.viaPath.length)) {
-      byTest.set(key, { test: name, file, viaPath, confidence });
+      byTest.set(key, {
+        test: name, file, viaPath, confidence, reason,
+        ...(structuralBasis ? { structuralBasis } : {}),
+      });
     }
   };
+
+  // Tiers 1 and 2 — the test files the diff itself touched. Every indexed test in such a file is
+  // selected; a file with none indexed yet (typically brand-new) is selected whole.
+  // Exact path: the loose suffix match seeds use would promote a same-named test in another folder
+  // to an always-select entry.
+  const testsByFile = new Map<string, FunctionNode[]>();
+  if (tierFiles.length > 0) {
+    for (const n of cg.nodes) {
+      if (!n.isTest || n.isExternal) continue;
+      const file = normalizeRelative(n.filePath);
+      (testsByFile.get(file) ?? testsByFile.set(file, []).get(file)!).push(n);
+    }
+  }
+  for (const { file, reason } of tierFiles) {
+    const tests = testsByFile.get(file) ?? [];
+    if (tests.length === 0) add(file, WHOLE_FILE_TEST, [], 'high', reason);
+    for (const t of tests) add(t.filePath, t.name, [t.name], 'high', reason);
+  }
 
   // Source 1 — test nodes reached by the backward call-walk.
   for (const [id, depth] of depthOf) {
     if (depth === 0) continue;
     const n = nodeMap.get(id);
     if (!n?.isTest || n.isExternal) continue;
+    const idPath = idPathToSeed(id);
+    if (crossesTestedBy(idPath)) continue;
     const confidence: Confidence = depth === 1 ? 'high' : depth <= 3 ? 'medium' : 'low';
-    add(n.filePath, n.name, pathToSeed(id), confidence);
+    add(n.filePath, n.name, pathToSeed(id), confidence, SELECTION_REASON.reaches(depth), basisOfPath(idPath));
   }
 
   // Source 2 — `tested_by` edges on any reached production node (catches import-
   // based associations whose test node isn't a real call-graph caller).
   for (const e of cg.edges) {
     if (e.kind !== 'tested_by') continue;
+    if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
     if (!depthOf.has(e.callerId)) continue; // production node not in the impacted set
+    const idPath = idPathToSeed(e.callerId);
+    // The backward walk crosses `tested_by` edges too, so a production node can be reached THROUGH
+    // this very test; selecting the test again via that node would serve a cyclic path.
+    if (idPath.includes(e.calleeId) || crossesTestedBy(idPath)) continue;
     const testFile = e.calleeId.includes('::') ? e.calleeId.split('::')[0] : e.calleeId;
     const onSeed = seedIds.has(e.callerId);
     const confidence: Confidence = onSeed ? 'high' : 'medium';
-    add(testFile, e.calleeName, [e.calleeName, ...pathToSeed(e.callerId)], confidence);
+    add(
+      testFile, e.calleeName, [e.calleeName, ...pathToSeed(e.callerId)], confidence,
+      SELECTION_REASON.reaches((depthOf.get(e.callerId) ?? 0) + 1),
+      withEdgeBasis(basisOfPath(idPath), e),
+    );
   }
 
   // Fallback — seeds with no reaching test at all: associate tests of sibling
@@ -295,6 +459,7 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
     cg.nodes.filter(n => n.isTest && !n.isExternal && depthOf.has(n.id)).map(n => n.id),
   );
   for (const e of cg.edges) {
+    if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
     if (e.kind === 'tested_by' && e.callerId && depthOf.has(e.callerId)) testSources.add(e.callerId);
   }
   const coveredByTest = new Map<string, number>();
@@ -314,14 +479,21 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
     if (coveredByTest.has(s.id)) continue;
     for (const e of cg.edges) {
       if (e.kind !== 'tested_by') continue;
+      if (input.directResolvedOnly && e.confidence === 'synthesized') continue;
       const prod = nodeMap.get(e.callerId);
       if (!prod || prod.filePath !== s.filePath) continue;
       const testFile = e.calleeId.includes('::') ? e.calleeId.split('::')[0] : e.calleeId;
-      add(testFile, e.calleeName, [e.calleeName, `(same file as ${s.name})`], 'low');
+      add(testFile, e.calleeName, [e.calleeName, `(same file as ${s.name})`], 'low', SELECTION_REASON.sameFile);
       usedFileFallback = true;
     }
   }
 
+  // The served `reason` is the one behind the kept entry, so it always agrees with that entry's
+  // `viaPath` and `confidence`; a tier entry is always the kept one (high, one-step path).
+  for (const [key, entry] of byTest) {
+    const others = [...(reasonsByTest.get(key) ?? [])].filter(r => r !== entry.reason).sort(compareReasons);
+    if (others.length > 0) entry.alsoIncludedBecause = others;
+  }
   const selectedTests = [...byTest.values()].sort(
     (a, b) => CONF_RANK[b.confidence] - CONF_RANK[a.confidence] ||
       a.file.localeCompare(b.file) || a.test.localeCompare(b.test),
@@ -331,8 +503,11 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
   const seedLangs = [...new Set(seeds.map(s => s.language))].sort();
   const graphHasTests = cg.nodes.some(n => n.isTest) || cg.edges.some(e => e.kind === 'tested_by');
   const langsWithTests = new Set(cg.nodes.filter(n => n.isTest).map(n => n.language));
-  const testDetection: 'full' | 'partial' | 'none' =
-    !graphHasTests ? 'none'
+  // With no changed production symbol (only test files changed) there is no language whose test
+  // detection the selection depends on.
+  const testDetection: 'full' | 'partial' | 'none' | 'not-applicable' =
+    seeds.length === 0 ? 'not-applicable'
+    : !graphHasTests ? 'none'
     : seedLangs.every(l => langsWithTests.has(l)) ? 'full'
     : 'partial';
 
@@ -340,13 +515,19 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
     'Static call-graph selection is an over-approximate prioritizer, not a sound replacement for the full suite.',
     'Dynamic dispatch, reflection, and dependency injection can under-select (a relevant test may be missed).',
   ];
-  if (testDetection === 'none') {
+  if (testDetection === 'none' && selectedTests.length > 0) {
+    caveats.push('No tests were detected in this graph, so reachability selected nothing; only changed or new test files were selected. Verify test-file detection for your languages.');
+  } else if (testDetection === 'none') {
     caveats.push('No tests were detected in this graph — the selection is empty, not "no tests needed". Verify test-file detection for your languages.');
   } else if (testDetection === 'partial') {
     caveats.push(`Test detection is incomplete for some changed languages (${seedLangs.join(', ')}); tests in undetected languages are missing.`);
   }
   if (usedFileFallback) {
     caveats.push('Some seeds had no reaching test; sibling-file tests were included at low confidence (likely newly-added or untested functions).');
+  }
+  if (!untrackedAssessed) caveats.push(UNTRACKED_NOT_ASSESSED);
+  if (untrackedOmitted > 0) {
+    caveats.push(`${untrackedOmitted} more untracked test file(s) beyond the first ${MAX_UNTRACKED_TIER_FILES} were not selected; commit or ignore generated test files, or run the full suite.`);
   }
   if (truncatedAtDepth !== undefined) {
     caveats.push(`Backward reachability was truncated at depth ${truncatedAtDepth}; deeper tests may exist — raise maxDepth or consult report_coverage_gaps.`);
@@ -359,7 +540,7 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
       `${omitted > 0 ? `, and ${omitted} more listed in seeds` : ''}.`,
     );
   }
-  if (selectedTests.length === 0 && testDetection !== 'none') {
+  if (selectedTests.length === 0 && testDetection !== 'none' && testDetection !== 'not-applicable') {
     caveats.push(truncatedAtDepth === undefined
       ? 'No test transitively reaches the change. It may be genuinely untested, or reached only via dynamic dispatch this static analysis cannot see.'
       : `No test was found within depth ${truncatedAtDepth}; deeper tests may exist beyond the disclosed traversal cap, or the change may be reached only via dynamic dispatch this static analysis cannot see.`);
@@ -375,7 +556,11 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
   // (change: add-multi-repo-federation)
   let federationBlock: Record<string, unknown> | undefined;
   const fedScope = resolveFederationScope(absDir, { federation: input.federation, federationRepos: input.federationRepos });
-  if (fedScope.active) {
+  if (fedScope.active && seeds.length === 0) {
+    federationBlock = {
+      federationNote: 'Federation scope was requested, but no changed production symbol resolved in the home repo — only changed test files were selected, and cross-repo test selection keys off changed published symbols, so nothing was propagated.',
+    };
+  } else if (fedScope.active) {
     const { tests: crossRepoTests, coverage } = await findCrossRepoTests(fedScope, seeds.map(s => s.name), { maxDepth, directResolvedOnly: input.directResolvedOnly });
     federationBlock = {
       crossRepoTests: crossRepoTests.map(t => ({ repo: t.repo, test: t.test.name, file: t.test.file, viaSymbol: t.viaSymbol, confidence: t.depth <= 1 ? 'high' : t.depth <= 3 ? 'medium' : 'low' })),
@@ -400,6 +585,9 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
     ...(federationBlock ? { federation: federationBlock } : {}),
     soundness: { posture: 'over-approximate' as const, caveats },
     coverage: { languages: seedLangs, testDetection },
+    // No test-outcome history is read, so no test is labeled flaky — and that absence is stated
+    // rather than implied (change: add-test-selection-safeguard-tiers).
+    flakiness: FLAKINESS_NOT_ASSESSED,
     // Selection is an over-approximation of what MUST run, but the backward reachability it rests
     // on is a lower bound: a test that only reaches a seed reflectively is not selected. Name the
     // sites that make it one (change: disclose-dynamic-boundary-regions).
@@ -410,4 +598,72 @@ export async function handleSelectTests(input: SelectTestsInput): Promise<unknow
       ...(dynamicCrossing ? { extraCrossings: [dynamicCrossing] } : {}),
     }),
   };
+}
+
+/**
+ * Untracked, non-ignored test files: brand-new tests that `git diff` never lists
+ * (change: add-test-selection-safeguard-tiers). Fail-soft — a repository git cannot list yields none.
+ */
+async function untrackedTestFiles(rootPath: string): Promise<string[] | null> {
+  try {
+    const { stdout } = await execFileGit(
+      'git', gitPathArgs('ls-files', '--others', '--exclude-standard', '-z'),
+      { cwd: rootPath, maxBuffer: UNTRACKED_LISTING_MAX_BYTES, timeout: GIT_LISTING_TIMEOUT_MS },
+    );
+    return String(stdout).split('\0').filter(path => path.length > 0 && isTestFile(path)).sort();
+  } catch {
+    // A listing that cannot be taken is disclosed by the caller, never reported as "no new tests".
+    return null;
+  }
+}
+
+/** Bytes of `git ls-files --others` output accepted before the listing is treated as not taken. */
+const UNTRACKED_LISTING_MAX_BYTES = 64 * 1024 * 1024;
+
+/** A git listing that has not returned by then (a held lock, a slow network mount) is treated as not taken. */
+const GIT_LISTING_TIMEOUT_MS = 30_000;
+
+/** Untracked test files selected whole, at most; the rest are disclosed (generated, un-ignored fixtures). */
+const MAX_UNTRACKED_TIER_FILES = 200;
+
+/** Stated rather than implied: no test-outcome history is read, so no test is labeled flaky. */
+const FLAKINESS_NOT_ASSESSED = {
+  assessed: false as const,
+  reason: 'No test-outcome history is read: flakiness at identical inputs is not assessed, and no test is labeled flaky.',
+};
+
+const UNTRACKED_NOT_ASSESSED =
+  'Untracked files could not be listed, so a brand-new untracked test may be missing from this selection.';
+
+/**
+ * The analyzed directory's path inside its git work tree (`pkgs/a/`), `''` at the root, or `undefined`
+ * outside a work tree. Diff paths are repository-relative; call-graph paths are relative to the
+ * analyzed directory.
+ */
+async function gitPrefix(rootPath: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileGit('git', gitPathArgs('rev-parse', '--show-prefix'), { cwd: rootPath, timeout: GIT_LISTING_TIMEOUT_MS });
+    return String(stdout).trim().replace(/\\/g, '/');
+  } catch {
+    return undefined;
+  }
+}
+
+function hasControlCharacter(path: string): boolean {
+  for (let i = 0; i < path.length; i++) {
+    const code = path.charCodeAt(i);
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return true;
+  }
+  return false;
+}
+
+/** A repository-relative diff path in the analyzed directory's frame, or `undefined` outside it. */
+function localPath(repoPath: string, prefix: string | undefined): string | undefined {
+  const path = normalizeRelative(repoPath);
+  if (!prefix) return path;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : undefined;
+}
+
+function normalizeRelative(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
 }

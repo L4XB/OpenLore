@@ -1,6 +1,7 @@
 # Test-selection safeguard tiers: always-select rules, flakiness disclosure, and a structural-confidence qualifier
 
-> Status: PROPOSED (2026-07-03, e2e audit pass 3). `select_tests` selects only by backward
+> Status: BUILT (2026-09-12), with the flakiness history reader deferred — see *Scope as built*.
+> Originally PROPOSED (2026-07-03, e2e audit pass 3). `select_tests` selects only by backward
 > reachability from changed symbols — it can miss a test whose own file changed, gives a brand-new
 > test no special standing, says nothing about historically flaky tests, and states its
 > confidence boundary only at the response level. Industrial test-impact products (Develocity
@@ -53,6 +54,24 @@ Cross-reference sibling: `add-coverage-map-test-selection` is the opt-in dynamic
 layer (coverage-artifact ingestion, dual-set output); this change is the deterministic SAFETY
 layer on the static side. Neither duplicates the other's mechanism: no coverage artifact is read
 here, and the safeguard tiers apply regardless of whether a coverage artifact is supplied there.
+
+## Scope as built
+
+- **Built:** the three tiers (including untracked new test files via the hardened git helper), a
+  per-test `reason` with `alsoIncludedBecause`, a per-test `structuralBasis` qualifier from the pair
+  edge index, and a `flakiness: { assessed: false }` disclosure. A diff touching only test files now
+  selects them instead of returning "no changed production functions".
+- **Deferred:** the flakiness history reader. No local source in the repository records per-test
+  outcomes against a tree hash: the repository writes no JUnit XML. CI does upload one per-test
+  report tied to a commit (`windows-unit-report`), but reading it means downloading a CI artifact over
+  the network for one platform's runs. Shipping the rule without a local source would be a guess; the
+  absence is disclosed instead. The "different tree-hash is not flagged" and "no `gh`, no crash"
+  tests are deferred with it.
+- **Narrowed:** the per-test qualifier counts synthesized edges only. The graph stores no separate
+  per-edge "heuristic" label, so "synthesized or heuristic" collapses to the synthesized label.
+- **Dropped:** the payload-budget re-assertion in `src/cli/commands/mcp-presets.test.ts`. That test
+  asserts no `select_tests` payload, and no byte budget applies to it; the new fields add about 55
+  bytes per selected test, and untracked tier files are capped at 200.
 
 ## Why this is in scope
 
