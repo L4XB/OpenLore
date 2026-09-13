@@ -16,9 +16,10 @@
  *
  * Four rules are load-bearing:
  *
- *  1. **Records, never resolves.** A site NEVER produces a node or an edge. Enabling the matcher
- *     leaves the emitted graph byte-identical. Recovering the statically-decidable subset is the
- *     job of the sibling change `resolve-literal-reflective-dispatch`, not this one.
+ *  1. **Records, never resolves.** A site NEVER produces a node or an edge. The matcher only records
+ *     candidates; the one structurally provable family — a stable literal dispatch table — is bound
+ *     after Pass 7 by `literal-reflection.ts` (change: resolve-literal-reflective-dispatch), which
+ *     discharges exactly the candidates it binds.
  *  2. **The partition is by resolution OUTCOME, not argument form.** Every recognized construct is
  *     a *candidate*; {@link finalizeDynamicBoundarySites} retracts only those the resolver actually
  *     bound to an internal symbol. A static literal that resolves to nothing, or ambiguously, still
@@ -87,8 +88,9 @@ export const DYNAMIC_BOUNDARY_REFUSALS = [
    * A static literal selector naming exactly ONE symbol, which the resolver nonetheless did not
    * bind to an edge. Its own reason because the alternative — folding it into
    * `unresolved-external` — states "resolves to no symbol" about a target that plainly does, which
-   * is a false statement from the feature whose whole claim is honesty. This is the case the
-   * sibling change `resolve-literal-reflective-dispatch` is built to recover.
+   * is a false statement from the feature whose whole claim is honesty. Bare-name reflection stays
+   * unrecovered by design (change: resolve-literal-reflective-dispatch re-scoped it out), so this
+   * reason remains a permanent disclosure.
    */
   'resolvable-but-unbound',
   /** A static literal selector that names more than one symbol; picking one would be a guess. */
@@ -100,6 +102,19 @@ export const DYNAMIC_BOUNDARY_REFUSALS = [
    * not check.
    */
   'unresolved-in-file-scope',
+  /**
+   * A literal dispatch table whose bound targets exceed the synthesis fan-out cap. The resolver
+   * emits no edge rather than a partial set (change: resolve-literal-reflective-dispatch).
+   */
+  'over-cap',
+  /**
+   * A construct literal reflection DID bind, surfaced only to a directly-resolved-only consumer:
+   * that consumer ignores the synthesized edge, so for it the construct is a boundary again. Never
+   * persisted as a site — bound constructs are persisted in their own list.
+   */
+  'synthesized-binding',
+  /** The targets resolve, but no indexed symbol contains the construct to be the edge's caller. */
+  'unattributed-caller',
 ] as const;
 
 export type DynamicBoundaryRefusal = (typeof DYNAMIC_BOUNDARY_REFUSALS)[number];
@@ -112,6 +127,9 @@ export const DYNAMIC_BOUNDARY_REFUSAL_LABEL: Record<DynamicBoundaryRefusal, stri
   'ambiguous-target': 'the named target resolves to more than one symbol',
   'unresolved-in-file-scope': 'the named target was not resolved within this file, and no '
     + 'repository-wide lookup was performed for this record',
+  'over-cap': 'the dispatch table binds more targets than the synthesis fan-out cap',
+  'synthesized-binding': 'a literal-reflective edge binds this dispatch, but directly-resolved-only traversal does not follow it',
+  'unattributed-caller': 'the target resolves, but no indexed symbol contains the call to attach it to',
 };
 
 /**
@@ -183,6 +201,12 @@ export interface FileDynamicBoundary {
   totalSites?: number;
   /** `sites` hit the cap — more exist than are listed. */
   truncated?: true;
+  /**
+   * Constructs literal reflection bound to an edge, so they are NOT sites (change:
+   * resolve-literal-reflective-dispatch). Persisted so a directly-resolved-only consumer — which
+   * ignores the synthesized edge — can still disclose them. Bounded like `sites`.
+   */
+  bound?: DynamicBoundarySite[];
 }
 
 /** The persisted, rolled-up report (`dynamic-boundary.json`). Absent when nothing was recorded. */
@@ -222,6 +246,30 @@ export interface DynamicBoundaryCandidate {
   evidenceTruncated?: true;
   /** The static literal the construct dispatches to, when it has one (`getattr(o, "run")`). */
   literalTarget?: string;
+  /**
+   * Retained under the separate budget for constructs recorded only because literal reflection can
+   * recover them (a literal-key dispatch into a stable table). Listed after every other site when a
+   * file's site list is capped, so they never crowd out a real boundary
+   * (change: resolve-literal-reflective-dispatch).
+   */
+  recoverable?: true;
+  /**
+   * The construct indexes a module-level literal dispatch table declared once in this file: the
+   * sorted, deduplicated names its entries bind (only the selected entry's when the key is a
+   * literal). `names` is bounded by {@link DYNAMIC_BOUNDARY_SITE_CAP}; `size` stays exact
+   * (change: resolve-literal-reflective-dispatch).
+   */
+  table?: {
+    names: string[];
+    size: number;
+    /**
+     * `[start, end)` byte span of each name's same-file module-level function declaration, parallel
+     * to `names`. Absent with `nonLocal` when any entry is bound by something else (an import, a
+     * variable), which a single file cannot resolve.
+     */
+    decls?: Array<[number, number]>;
+    nonLocal?: true;
+  };
   /**
    * The EXACT number of constructs matched in this file, present on the first candidate only and
    * only when the retained list was capped. Keeps a file's reported scale true after the matcher
@@ -343,6 +391,12 @@ interface LanguageSpec {
    * self-like receiver, and the bare-name matching the honesty contract forbids never happens.
    */
   calleeKindsOnAnyReceiver?: boolean;
+  /**
+   * How a module-level literal dispatch table is declared, when this language's tables are read for
+   * literal-reflection recovery (change: resolve-literal-reflective-dispatch). Recording only; the
+   * resolver binds after Pass 7.
+   */
+  dispatchTables?: 'js';
 }
 
 /**
@@ -557,6 +611,7 @@ function tsSpec(): LanguageSpec {
     diMethods: ['get', 'resolve', 'make', 'cradle'],
     importStyle: 'js',
     importNodeTypes: ['import_statement'],
+    dispatchTables: 'js',
   };
 }
 
@@ -566,6 +621,18 @@ function tsSpec(): LanguageSpec {
  */
 export function supportsDynamicBoundary(language: string): boolean {
   return Object.hasOwn(DYNAMIC_BOUNDARY_LANG_SPECS, language);
+}
+
+/**
+ * True when this language's matcher records the structure literal-reflection recovery needs — a
+ * module-level literal dispatch table (change: resolve-literal-reflective-dispatch).
+ * Read from the same table, so the capability registry cannot claim a rule that does not exist.
+ */
+export function supportsLiteralReflection(language: string): boolean {
+  const spec = Object.hasOwn(DYNAMIC_BOUNDARY_LANG_SPECS, language)
+    ? DYNAMIC_BOUNDARY_LANG_SPECS[language]
+    : undefined;
+  return !!spec?.dispatchTables;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -689,13 +756,12 @@ function literalTargetOf(
   const actual = childrenOf(args).filter(c => c.type !== ',' && c.type !== '(' && c.type !== ')');
   const selector = actual[selectorIndex];
   if (!selector) return undefined;
-  if (spec.literalTypes.includes(selector.type)) return literalValue(textOf(source, selector));
   // A quoted literal wraps its content in a child node in several grammars; look exactly one level
-  // in, never across siblings.
-  for (const c of childrenOf(selector)) {
-    if (spec.literalTypes.includes(c.type)) return literalValue(textOf(source, c));
-  }
-  return undefined;
+  // in, and only into a wrapper — never into an expression that merely contains a literal.
+  const literal = spec.literalTypes.includes(selector.type)
+    ? selector
+    : wrappedLiteral(source, spec, selector);
+  return literal ? literalValue(textOf(source, literal)) : undefined;
 }
 
 /** The dotted text of a call's callee (`Reflect.get`), or undefined when it is not a member access. */
@@ -741,12 +807,6 @@ export function triggersFor(spec: { triggers: string[]; diPackages?: string[]; g
     ...(spec.diPackages ?? []),
     ...(spec.gatedMethods ?? []).flatMap(g => g.requires),
   ];
-}
-
-/** Push a node's children so they pop in source order — one definition, so no branch can diverge. */
-function pushChildren(stack: DynamicBoundaryNode[], n: DynamicBoundaryNode): void {
-  const kids = childrenOf(n);
-  for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
 }
 
 /**
@@ -812,11 +872,21 @@ export function matchDynamicBoundaries(
   const atOffset = new Map<number, DynamicBoundaryCandidate>();
   const seen = new Set<number>();
   let matched = 0;
+  // Module-level dispatch tables, read only when a subscript call's receiver could name one.
+  let tables: Map<string, StableTable> | undefined;
+  const stableTables = (): Map<string, StableTable> =>
+    (tables ??= spec.dispatchTables === 'js' ? collectStableTables(root, source) : new Map());
+  // Retention is budgeted separately for the literal-key table dispatches literal reflection records,
+  // so a file full of bindable `TABLE["k"]()` calls cannot crowd a real boundary out of the list.
+  let retainedMain = 0;
+  let retainedRecoverable = 0;
+  /** Returns the NEWLY retained candidate, so a rule can attach recovery facts to it. */
   const record = (
     kind: DynamicBoundaryKind,
     node: DynamicBoundaryNode,
     literalTarget?: string,
-  ): void => {
+    recoverable = false,
+  ): DynamicBoundaryCandidate | undefined => {
     // One construct yields at most one candidate: a nested match (`getattr(o, x)()`) must not be
     // counted twice, and double-counting would inflate the density budget as well as the receipt.
     //
@@ -839,7 +909,7 @@ export function matchDynamicBoundaries(
       if (existing && literalTarget && !existing.literalTarget && existing.kind === kind) {
         existing.literalTarget = literalTarget;
       }
-      return;
+      return undefined;
     }
     seen.add(node.startIndex);
     matched++;
@@ -848,7 +918,8 @@ export function matchDynamicBoundaries(
     // worker, held for the whole build, and JSON-serialized into a fact-cache row — megabytes per
     // file, for a set the artifact caps at fifty anyway. `matched` keeps the count exact so the
     // truncation receipt still reports the true scale.
-    if (out.length >= DYNAMIC_BOUNDARY_SITE_CAP) return;
+    if ((recoverable ? retainedRecoverable : retainedMain) >= DYNAMIC_BOUNDARY_SITE_CAP) return undefined;
+    if (recoverable) retainedRecoverable++; else retainedMain++;
     const { evidence, truncated } = toEvidence(textOf(source, node));
     const candidate: DynamicBoundaryCandidate = {
       kind,
@@ -858,8 +929,10 @@ export function matchDynamicBoundaries(
       ...(truncated ? { evidenceTruncated: true as const } : {}),
       ...(literalTarget ? { literalTarget } : {}),
     };
+    if (recoverable) candidate.recoverable = true;
     out.push(candidate);
     atOffset.set(node.startIndex, candidate);
+    return candidate;
   };
 
   const stack: DynamicBoundaryNode[] = [root];
@@ -884,7 +957,29 @@ export function matchDynamicBoundaries(
         const index = field(fn, 'index') ?? field(fn, 'subscript')
           ?? childrenOf(fn).slice(1).find(c => c.type !== '[' && c.type !== ']');
         const staticIndex = !!index && !!spec.staticIndexTypes?.includes(index.type);
-        if (!staticIndex && !isGenericSubscription(source, fn, spec)) record('computed-member', n);
+        const receiverNode = field(fn, 'object') ?? field(fn, 'value') ?? childrenOf(fn)[0];
+        const receiver = receiverNode ? textOf(source, receiverNode).trim() : '';
+        const table = spec.dispatchTables && IDENTIFIER.test(receiver)
+          ? stableTables().get(receiver)
+          : undefined;
+        const key = index ? staticKeyOf(source, index) : undefined;
+        if (table && key !== undefined) {
+          // A literal-key dispatch into a stable table: recorded even though its index is static,
+          // because literal reflection recovers it and only a recorded candidate keeps an unrecovered
+          // one disclosed (change: resolve-literal-reflective-dispatch).
+          const hit = table.entries.get(key);
+          if (hit) {
+            const c = record('computed-member', n, undefined, true);
+            if (c) c.table = tableFact(table, [hit]);
+          } else if (!staticIndex) {
+            record('computed-member', n);
+          }
+        } else if (!staticIndex && !isGenericSubscription(source, fn, spec)) {
+          // A dispatch into a stable table is retained under the recoverable budget too, so a file of
+          // bindable table dispatches can never crowd a real boundary out of the retained candidates.
+          const c = record('computed-member', n, undefined, !!table);
+          if (c && table) c.table = tableFact(table, [...table.entries.values()]);
+        }
       } else if (text) {
         // A dotted rule is checked first, on the FULL dotted text: `Reflect.get` must never be read
         // as a bare `get`.
@@ -1029,18 +1124,308 @@ function isSelfDotted(text: string): boolean {
   return receiver === 'self' || receiver === 'this' || receiver === 'super' || receiver === 'cls';
 }
 
+/**
+ * The literal a wrapper node carries, or undefined. Only a WRAPPER shape — an argument node (which may
+ * carry a named-argument label, `callback: 'run'`), a string, or a symbol — is looked into, and only
+ * when it holds exactly one literal and no interpolation. An expression that merely contains a literal
+ * (`"get_" + name`, a concatenated string) is never read: that would reconstruct a partial name for a
+ * dispatch computed at runtime (change: resolve-literal-reflective-dispatch).
+ */
+function wrappedLiteral(
+  source: string,
+  spec: LanguageSpec,
+  node: DynamicBoundaryNode,
+): DynamicBoundaryNode | undefined {
+  if (!/argument|string|symbol/.test(node.type) || /concatenated/.test(node.type)) return undefined;
+  const kids = childrenOf(node);
+  if (kids.some(k => /interpolation|substitution/.test(k.type))) return undefined;
+  const literals = kids.filter(k => spec.literalTypes.includes(k.type));
+  // A literal whose own text is a fragment of a larger string (`string_content` beside an escape) is
+  // still one literal only when it is the sole literal child.
+  return literals.length === 1 && textOf(source, literals[0]).length > 0 ? literals[0] : undefined;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Literal dispatch tables (change: resolve-literal-reflective-dispatch)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A key's text with one layer of quoting removed; numbers and bare names are returned unchanged. */
+function keyText(text: string): string {
+  const t = text.trim();
+  return t.length >= 2 && (t[0] === '"' || t[0] === "'" || t[0] === '`') && t.endsWith(t[0])
+    ? t.slice(1, -1)
+    : t;
+}
+
+/** Push a node's children so they pop in source order — one definition, so no branch can diverge. */
+function pushChildren(stack: DynamicBoundaryNode[], n: DynamicBoundaryNode): void {
+  const kids = childrenOf(n);
+  for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+}
+
+/**
+ * The JavaScript property key a literal denotes, or undefined when it is not a plain literal key. A
+ * number canonicalizes the way JavaScript does (`1.0` and `1` are the same property); a string or a
+ * substitution-free template keeps its text, and one carrying an escape is refused rather than
+ * decoded (`"a"` is `a`, and a text comparison would call them different).
+ */
+function staticKeyOf(source: string, node: DynamicBoundaryNode): string | undefined {
+  const text = textOf(source, node).trim();
+  if (node.type === 'number') {
+    // A legacy octal (`010` is 8), a separator or a BigInt suffix is refused rather than canonicalized.
+    if (/^0\d/.test(text) || /[_n]/.test(text)) return undefined;
+    const value = Number(text);
+    return Number.isFinite(value) ? String(value) : undefined;
+  }
+  if (node.type === 'property_identifier') return text;
+  const plain = node.type === 'string'
+    || (node.type === 'template_string' && !childrenOf(node).some(c => c.type === 'template_substitution'));
+  if (!plain) return undefined;
+  const inner = keyText(text);
+  return inner.includes('\\') ? undefined : inner;
+}
+
+/** A JS/TS object literal of literal keys → identifier values, or null when it is anything else. */
+function jsTable(source: string, value: DynamicBoundaryNode | undefined): Map<string, string> | null {
+  let v = value;
+  while (v && (v.type === 'as_expression' || v.type === 'satisfies_expression'
+    || v.type === 'parenthesized_expression')) {
+    v = childrenOf(v).find(c => c.type !== '(' && c.type !== ')');
+  }
+  if (!v || v.type !== 'object') return null;
+  const table = new Map<string, string>();
+  for (const e of childrenOf(v)) {
+    if (e.type === '{' || e.type === '}' || e.type === ',' || e.type === 'comment') continue;
+    if (e.type === 'shorthand_property_identifier') {
+      if (textOf(source, e) === '__proto__') return null;
+      table.set(textOf(source, e), textOf(source, e));
+      continue;
+    }
+    if (e.type !== 'pair') return null;
+    const keyNode = field(e, 'key');
+    const val = field(e, 'value');
+    const key = keyNode ? staticKeyOf(source, keyNode) : undefined;
+    if (key === undefined || val?.type !== 'identifier') return null;
+    // `__proto__: x` sets the prototype instead of an entry, so a variable key could reach an inherited
+    // target the table does not list.
+    if (key === '__proto__') return null;
+    table.set(key, textOf(source, val));
+  }
+  return table.size > 0 ? table : null;
+}
+
+/** A stable table: its entries, and the same-file declaration span of each entry that is local. */
+interface StableTable {
+  entries: Map<string, string>;
+  local: Map<string, [number, number]>;
+}
+
+/** The candidate's table fact: sorted distinct names, with spans only when every name is local. */
+function tableFact(t: StableTable, values: string[]): NonNullable<DynamicBoundaryCandidate['table']> {
+  const sorted = [...new Set(values)].sort();
+  const names = sorted.slice(0, DYNAMIC_BOUNDARY_SITE_CAP);
+  const decls = names.map(n => t.local.get(n));
+  return names.length === sorted.length && decls.every(d => d !== undefined)
+    ? { names, size: sorted.length, decls: decls as Array<[number, number]> }
+    : { names, size: sorted.length, nonLocal: true };
+}
+
+/** Identifier-shaped node types that can REFER to a module-level binding. */
+const REFERENCE_TYPES = new Set(['identifier', 'shorthand_property_identifier', 'shorthand_property_identifier_pattern']);
+
+/** Node types whose named field is a write target: every binding identifier in it is written. */
+const WRITE_TARGET_FIELDS: Record<string, string> = {
+  assignment_expression: 'left', augmented_assignment_expression: 'left', update_expression: 'argument',
+  for_in_statement: 'left',
+};
+
+/** Pattern shapes a write target descends through (`[a, { b }] = …`); anything else stops it. */
+const WRITE_PATTERN_TYPES = new Set([
+  'array_pattern', 'object_pattern', 'pair_pattern', 'assignment_pattern', 'object_assignment_pattern',
+  'rest_pattern', 'parenthesized_expression',
+]);
+
+/** Node types that open a function scope, where a `var` no longer declares a module binding. */
+const FUNCTION_SCOPE_TYPES = new Set([
+  'function_declaration', 'function_expression', 'function', 'arrow_function', 'generator_function',
+  'generator_function_declaration', 'method_definition', 'class_body',
+]);
+
+/**
+ * Module-private `const` dispatch tables that are STABLE in this file (JS/TS).
+ *
+ * Stability is decided by USE, not by spotting mutations: every occurrence of the table's name must
+ * be its own declaration, a type query, or the receiver of an immediately invoked subscript
+ * (`NAME[k]()`). Any other use — an alias, an argument, an export, a shadowing parameter or local, an
+ * assignment, `Reflect.set` — could extend or replace the table at runtime, and resolving through it
+ * would be a guess. An exported table is refused outright (an importer can mutate it), and a file
+ * that evaluates code (`eval`, `new Function`) has no stable table at all.
+ *
+ * An entry is `local` only when its name is bound exactly once at module level, by a function
+ * declaration or a `const` arrow/function expression in this file, is never written anywhere in the
+ * file, and its declaration never mentions `this` (a `NAME[k]()` call passes the table as `this`, so
+ * such an entry could extend the table it lives in). Anything else is a reference one file cannot
+ * resolve.
+ *
+ * Cost: a shallow scan of the top-level statements; the full walk runs only in a file that declares
+ * at least one candidate table.
+ */
+function collectStableTables(root: DynamicBoundaryNode, source: string): Map<string, StableTable> {
+  const declared = new Map<string, { entries: Map<string, string>; nameStart: number }>();
+  const bindings = new Map<string, number>();
+  const functionSpans = new Map<string, [number, number]>();
+  const exported = new Set<string>();
+  const bind = (name: string, isExport: boolean): void => {
+    bindings.set(name, (bindings.get(name) ?? 0) + 1);
+    if (isExport) exported.add(name);
+  };
+  const bindAll = (node: DynamicBoundaryNode, isExport: boolean): void => {
+    const stack = [node];
+    while (stack.length > 0) {
+      const m = stack.pop()!;
+      if (REFERENCE_TYPES.has(m.type)) bind(textOf(source, m), isExport);
+      for (const k of childrenOf(m)) stack.push(k);
+    }
+  };
+  for (const top of childrenOf(root)) {
+    const isExport = top.type === 'export_statement';
+    for (const decl of isExport ? childrenOf(top) : [top]) {
+      if (decl.type === 'function_declaration' || decl.type === 'generator_function_declaration'
+        || decl.type === 'class_declaration' || decl.type === 'abstract_class_declaration') {
+        const name = field(decl, 'name');
+        if (!name) continue;
+        bind(textOf(source, name), isExport);
+        if (decl.type.includes('function')) functionSpans.set(textOf(source, name), [decl.startIndex, decl.endIndex]);
+      } else if (decl.type === 'lexical_declaration' || decl.type === 'variable_declaration') {
+        const isConst = decl.type === 'lexical_declaration' && childrenOf(decl)[0]?.type === 'const';
+        for (const d of childrenOf(decl)) {
+          if (d.type !== 'variable_declarator') continue;
+          const name = field(d, 'name');
+          if (!name) continue;
+          if (name.type !== 'identifier') {
+            bindAll(name, isExport);
+            continue;
+          }
+          const text = textOf(source, name);
+          bind(text, isExport);
+          const value = field(d, 'value');
+          if (isConst && (value?.type === 'arrow_function' || value?.type === 'function_expression'
+            || value?.type === 'function')) {
+            functionSpans.set(text, [d.startIndex, d.endIndex]);
+          }
+          const entries = isConst ? jsTable(source, value) : null;
+          if (entries) declared.set(text, { entries, nameStart: name.startIndex });
+        }
+      } else if (decl.type === 'import_statement') {
+        for (const clause of childrenOf(decl)) if (clause.type === 'import_clause') bindAll(clause, false);
+      }
+    }
+  }
+
+  const names = new Set([...declared.keys()].filter(n => !exported.has(n) && bindings.get(n) === 1));
+  const stable = new Map<string, StableTable>();
+  if (names.size === 0) return stable;
+  const entryNames = new Set<string>();
+  for (const name of names) for (const v of declared.get(name)!.entries.values()) entryNames.add(v);
+
+  const unstable = new Set<string>();
+  const written = new Set<string>();
+  const nestedVarBindings = new Set<string>();
+  const thisAt: number[] = [];
+  let evaluatesCode = false;
+  const same = (x: DynamicBoundaryNode | undefined, y: DynamicBoundaryNode): boolean =>
+    !!x && x.startIndex === y.startIndex && x.endIndex === y.endIndex;
+  type Frame = {
+    n: DynamicBoundaryNode; parent?: DynamicBoundaryNode; grand?: DynamicBoundaryNode;
+    writing: boolean; inFunction: boolean;
+  };
+  const walk: Frame[] = [{ n: root, writing: false, inFunction: false }];
+  while (walk.length > 0) {
+    const { n, parent, grand, writing, inFunction } = walk.pop()!;
+    if (n.type === 'this') thisAt.push(n.startIndex);
+    // Code evaluation or dynamic scope anywhere makes every table in the file unprovable: `eval` in any
+    // spelling (`(eval)(…)` is still a direct eval), `Function(…)` with or without `new`, and `with`.
+    if (n.type === 'with_statement') evaluatesCode = true;
+    // `globalThis.eval(…)` names it as a property, and `(0, eval)(…)` as a plain identifier.
+    if (n.type === 'identifier' || n.type === 'property_identifier') {
+      if (textOf(source, n) === 'eval') evaluatesCode = true;
+    }
+    if (n.type === 'identifier') {
+      const name = textOf(source, n);
+      if (name === 'Function' && (parent?.type === 'new_expression' || parent?.type === 'call_expression')) {
+        evaluatesCode = true;
+      }
+    }
+    // A `var` nested in a top-level block (not in a function) declares a MODULE binding too.
+    if (!inFunction && n.type === 'variable_declaration' && parent && parent !== root) {
+      for (const d of childrenOf(n)) {
+        const name = d.type === 'variable_declarator' ? field(d, 'name') : undefined;
+        if (!name) continue;
+        const stack = [name];
+        while (stack.length > 0) {
+          const m = stack.pop()!;
+          if (REFERENCE_TYPES.has(m.type)) nestedVarBindings.add(textOf(source, m));
+          for (const k of childrenOf(m)) stack.push(k);
+        }
+      }
+    }
+    if (REFERENCE_TYPES.has(n.type)) {
+      const text = textOf(source, n);
+      if (writing && entryNames.has(text)) written.add(text);
+      if (names.has(text) && !unstable.has(text)) {
+        const callee = grand?.type === 'call_expression' ? field(grand, 'function') : undefined;
+        const allowed = n.startIndex === declared.get(text)!.nameStart
+          || parent?.type === 'type_query'
+          || (n.type === 'identifier' && parent?.type === 'subscript_expression'
+            && field(parent, 'object')?.startIndex === n.startIndex
+            && callee?.startIndex === parent.startIndex && callee.endIndex === parent.endIndex);
+        if (!allowed) unstable.add(text);
+      }
+    }
+    const targetField = WRITE_TARGET_FIELDS[n.type];
+    const target = targetField ? field(n, targetField) : undefined;
+    const childInFunction = inFunction || FUNCTION_SCOPE_TYPES.has(n.type);
+    for (const k of childrenOf(n)) {
+      const childWriting = (writing && WRITE_PATTERN_TYPES.has(n.type)) || same(target, k);
+      walk.push({ n: k, parent: n, grand: parent, writing: childWriting, inFunction: childInFunction });
+    }
+  }
+  if (evaluatesCode) return stable;
+  thisAt.sort((x, y) => x - y);
+  /** Is any `this` token inside `[start, end)`? Binary search over the sorted offsets. */
+  const thisWithin = (start: number, end: number): boolean => {
+    let lo = 0;
+    let hi = thisAt.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (thisAt[mid] < start) lo = mid + 1; else hi = mid;
+    }
+    return lo < thisAt.length && thisAt[lo] < end;
+  };
+
+  for (const name of names) {
+    if (unstable.has(name) || nestedVarBindings.has(name)) continue;
+    const { entries } = declared.get(name)!;
+    const local = new Map<string, [number, number]>();
+    for (const value of new Set(entries.values())) {
+      const span = functionSpans.get(value);
+      if (!span || bindings.get(value) !== 1 || written.has(value) || nestedVarBindings.has(value)) continue;
+      if (thisWithin(span[0], span[1])) continue;
+      local.set(value, span);
+    }
+    stable.set(name, { entries, local });
+  }
+  return stable;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The partition: candidates → sites, decided by resolution OUTCOME
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** What the resolver did with a candidate's literal target. Supplied by the caller after Pass 2. */
 /**
  * The synthesis rule a reflective-resolution edge carries. Declared here, next to the partition it
- * governs, so the recovering change (`resolve-literal-reflective-dispatch`) and the disclosing one
- * cannot drift apart on the name.
- *
- * Nothing emits it yet, which is the correct state: today's resolver really does bind no edge for
- * any of these constructs, so today every candidate becomes a site.
+ * governs, so the recovering change (`resolve-literal-reflective-dispatch`, `literal-reflection.ts`)
+ * and the disclosing one cannot drift apart on the name.
  */
 export const REFLECTIVE_RESOLUTION_RULE = 'literal-reflective';
 
@@ -1064,6 +1449,12 @@ export interface ResolutionProbe {
    * `unresolved-in-file-scope` rather than a repository-wide claim the probe never checked.
    */
   countSymbolsNamed(name: string): number | null;
+  /**
+   * The resolver's OWN refusal for a construct it attempted and declined (`over-cap`,
+   * `unresolved-in-file-scope`, `unattributed-caller`, …). Wins over the name count, which cannot see
+   * a table's entries (change: resolve-literal-reflective-dispatch).
+   */
+  refusalFor?(candidate: { startIndex: number }): DynamicBoundaryRefusal | undefined;
 }
 
 /** A candidate with its enclosing-symbol attribution filled in by the extractor. */
@@ -1080,9 +1471,8 @@ export interface AttributedCandidate extends DynamicBoundaryCandidate {
  * external target resolves to nothing, and would otherwise produce neither an edge nor a site —
  * a silent hole that reads as "no dynamic dispatch here".
  *
- * With no reflective resolver wired (the sibling change `resolve-literal-reflective-dispatch` owns
- * that), `resolvedToEdge` is false for every candidate and every one becomes a site — which is the
- * honest answer for today's graph, since today's graph really does emit no edge for them.
+ * Only a literal dispatch table is ever bound (change: resolve-literal-reflective-dispatch); every
+ * other candidate reaches this function unbound and becomes a site.
  */
 export function finalizeDynamicBoundarySites(
   candidates: AttributedCandidate[],
@@ -1091,13 +1481,19 @@ export function finalizeDynamicBoundarySites(
   const sites: DynamicBoundarySite[] = [];
   for (const c of candidates) {
     if (probe.resolvedToEdge(c)) continue;
-    let refusal: DynamicBoundaryRefusal = 'no-static-target';
-    if (c.literalTarget) {
+    let refusal: DynamicBoundaryRefusal = probe.refusalFor?.(c) ?? 'no-static-target';
+    if (refusal !== 'no-static-target') {
+      // The resolver's own reason stands.
+    } else if (c.literalTarget) {
       const count = probe.countSymbolsNamed(c.literalTarget);
       refusal = count === null ? 'unresolved-in-file-scope'
         : count === 0 ? 'unresolved-external'
         : count === 1 ? 'resolvable-but-unbound'
         : 'ambiguous-target';
+    } else if (c.table) {
+      // The table was read but no resolver decided it (the single-file lane, or a subset rebuild that
+      // binds nothing): a named table is not "computed at runtime", and nothing here can say more.
+      refusal = 'unresolved-in-file-scope';
     }
     sites.push({
       line: c.line,
@@ -1117,6 +1513,25 @@ export function finalizeDynamicBoundarySites(
 }
 
 /**
+ * The constructs the resolver BOUND, as records for the persisted `bound` list — never as sites. A
+ * directly-resolved-only consumer folds them back in as `synthesized-binding` boundaries, because it
+ * ignores the edge that discharged them (change: resolve-literal-reflective-dispatch).
+ */
+export function boundDynamicBoundarySites(
+  candidates: AttributedCandidate[],
+  probe: ResolutionProbe,
+): DynamicBoundarySite[] {
+  return candidates.filter(c => probe.resolvedToEdge(c)).map(c => ({
+    line: c.line,
+    kind: c.kind,
+    refusal: 'synthesized-binding' as const,
+    ...(c.symbolId ? { symbolId: c.symbolId } : { unattributed: true as const }),
+    evidence: c.evidence,
+    ...(c.evidenceTruncated ? { evidenceTruncated: true as const } : {}),
+  }));
+}
+
+/**
  * Build one file's record from its finalized sites, or `undefined` when it has none.
  *
  * `matchedTotal` is the count the MATCHER saw before it bounded what it carried; without it a file
@@ -1129,18 +1544,27 @@ export function buildFileDynamicBoundary(
   language: string,
   allSites: DynamicBoundarySite[],
   matchedTotal?: number,
+  extras?: { deferred?: DynamicBoundarySite[]; bound?: DynamicBoundarySite[] },
 ): FileDynamicBoundary | undefined {
-  if (allSites.length === 0) return undefined;
-  const sorted = [...allSites].sort(
-    (a, b) => a.line - b.line || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0),
-  );
-  const kept = sorted.slice(0, DYNAMIC_BOUNDARY_SITE_CAP);
-  const total = Math.max(matchedTotal ?? 0, sorted.length);
+  const deferred = extras?.deferred ?? [];
+  const bound = extras?.bound ?? [];
+  if (allSites.length === 0 && deferred.length === 0 && bound.length === 0) return undefined;
+  const byLine = (a: DynamicBoundarySite, b: DynamicBoundarySite): number =>
+    a.line - b.line || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0);
+  // Deferred sites (constructs recorded only because literal reflection could recover them) fill
+  // whatever room the real boundaries leave, so they can never push one out of the list.
+  const main = [...allSites].sort(byLine).slice(0, DYNAMIC_BOUNDARY_SITE_CAP);
+  const kept = [...main, ...[...deferred].sort(byLine).slice(0, DYNAMIC_BOUNDARY_SITE_CAP - main.length)]
+    .sort(byLine);
+  const total = Math.max(matchedTotal ?? 0, allSites.length + deferred.length);
   return {
     filePath,
     language,
     sites: kept,
     ...(total > kept.length ? { totalSites: total, truncated: true as const } : {}),
+    // Not sliced: bound constructs come only from retained candidates, which the two retention budgets
+    // already bound, and a strict consumer must count every one of them.
+    ...(bound.length > 0 ? { bound: [...bound].sort(byLine) } : {}),
   };
 }
 
@@ -1157,7 +1581,9 @@ export function fileSiteCount(f: FileDynamicBoundary): number {
 export function buildDynamicBoundaryReport(
   records: FileDynamicBoundary[],
 ): DynamicBoundaryReport | undefined {
-  const files = records.filter(r => r.sites.length > 0);
+  // A record carrying only bound constructs is kept (a directly-resolved-only consumer discloses it)
+  // but contributes nothing to the site rollups.
+  const files = records.filter(r => fileSiteCount(r) > 0 || (r.bound?.length ?? 0) > 0);
   if (files.length === 0) return undefined;
 
   const kindCounts = new Map<DynamicBoundaryKind, number>();
@@ -1165,6 +1591,7 @@ export function buildDynamicBoundaryReport(
   let totalSites = 0;
 
   for (const f of files) {
+    if (fileSiteCount(f) === 0) continue;
     totalSites += fileSiteCount(f);
     for (const s of f.sites) kindCounts.set(s.kind, (kindCounts.get(s.kind) ?? 0) + 1);
     const l = langCounts.get(f.language) ?? { files: 0, sites: 0 };
@@ -1176,7 +1603,7 @@ export function buildDynamicBoundaryReport(
   return {
     version: DYNAMIC_BOUNDARY_SCHEMA_VERSION,
     totalSites,
-    totalFiles: files.length,
+    totalFiles: files.filter(f => fileSiteCount(f) > 0).length,
     byKind: DYNAMIC_BOUNDARY_KINDS
       .filter(k => kindCounts.has(k))
       .map(k => ({ kind: k, count: kindCounts.get(k)! })),

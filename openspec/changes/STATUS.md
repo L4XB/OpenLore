@@ -38,9 +38,7 @@ requirements reflected in the main specs. `openspec list` shows only open work.
 
 ## In flight — 1
 
-`shrink-receiver-resolution-boundary` — chained intra-object receiver resolution
-(`this.<field>.m()` / `self.<field>.m()`), on a branch with its `change:` markers in `src/`. Archive
-it the moment it merges.
+None. (`shrink-receiver-resolution-boundary` merged in #465 and awaits archiving.)
 
 A change belongs here the moment its implementation starts; move it back out (archive it) the
 moment its marker/spec evidence lands.
@@ -202,6 +200,15 @@ names the specific construct, `report_coverage_gaps` withholds `also-dead`, and 
 opposite conclusion. Four adversarial review rounds plus an end-to-end dogfood on three external
 repositories found 19 defects during the build, the sharpest being a `moduleLevel` marker that was
 false on 38% of sites and a retraction key that let an ordinary call erase a site outright.
+
+Shipped and archived since: `resolve-literal-reflective-dispatch` (2026-09-12) — a stable
+module-private JS/TS literal dispatch table (`HANDLERS[k]()`, `HANDLERS["create"]()`) now binds each
+entry by its same-file declaration as a `literal-reflective` synthesized edge; every refusal stays a
+disclosed dynamic-boundary site. Bound constructs are persisted separately so directly-resolved-only
+conclusions still disclose them, a subset rebuild or an over-bound file binds nothing, and the watcher
+re-derives rebuilt callers. Three rounds of four adversarial reviews re-scoped it twice: self-typed
+receivers (`this["m"]()`, `getattr(self, "m")()`) were built and then removed because the class graph
+cannot bound the receiver type soundly, and container resolution and Python dicts stay disclosed.
 
 ## Maintenance rules (what kept this table honest)
 

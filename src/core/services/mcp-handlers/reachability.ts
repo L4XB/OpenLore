@@ -266,7 +266,9 @@ export async function handleFindDeadCode(input: FindDeadCodeInput): Promise<unkn
   // Dynamic-boundary sites (change: disclose-dynamic-boundary-regions). Read once per invocation —
   // and not at all beyond this, since a repository with no site has no artifact. The crossing itself
   // is assembled per answer, from the files THAT answer touched, never from the repository.
-  const dynamicReport = await loadDynamicBoundaryReport(absDir);
+  // Strict mode folds bound literal-reflection constructs back in as sites: it ignores their edges
+  // (change: resolve-literal-reflective-dispatch).
+  const dynamicReport = await loadDynamicBoundaryReport(absDir, undefined, { directResolvedOnly: input.directResolvedOnly });
   const qualifyDynamic = buildQualifier(dynamicReport, dep?.imports ?? new Map());
 
   // ── Delete-impact mode: "what becomes dead if I delete X?" ──────────────────
