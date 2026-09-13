@@ -43,7 +43,7 @@ requirements reflected in the main specs. `openspec list` shows only open work.
 A change belongs here the moment its implementation starts; move it back out (archive it) the
 moment its marker/spec evidence lands.
 
-## To build — 102
+## To build — 101
 
 The whole open set is unbuilt backlog. Newest additions: 7 proposals from the 2026-07-27
 first-run e2e (`E2E-FIRSTRUN-2026-07-27.md`). Other thematic indexes:
@@ -134,7 +134,6 @@ trust boundary for served content.
 | `add-symbol-provenance-conclusions` | when did this exist, what changed it last, what moves with it |
 | `add-vuln-reachability-triage` | is the vulnerable function actually reachable from my code? |
 | `adopt-agent-context-interop` | AGENTS.md first-class, the orient skill portable, the injected digest evidence-slim |
-| `adopt-mcp-protocol-conformance` | guarded annotations, output schemas, actionable errors, elicitation |
 | `adopt-mcp-tasks-and-cache-hints` | cache hints carry the lease, tasks carry long builds |
 | `adopt-spec-link-status-vocabulary` | name "Unwanted", "Predated", and shallow-vs-deep coverage, from OpenFastTrace |
 | `align-api-layer-with-cli-core` | The programmatic API is a fork of the CLI pipeline, not a facade over it — realign and make its contract embedder-safe |
@@ -227,6 +226,15 @@ served path and any other reasons, a path across synthesized edges carries a `st
 adversarial reviews fixed path frames for subdirectory analysis, over-broad test classification,
 string-sorted depth reasons, cyclic `tested_by` paths, and an unbounded, silently failing untracked
 listing (now capped at 200 with disclosure).
+
+Shipped and archived since: `adopt-mcp-protocol-conformance` (2026-09-12, narrowed) — tool
+annotations have no read-only fallback, and a TypeScript-checker trace from every dispatch branch to
+write, spawn, and worker primitives fails CI when a read-only tool reaches a write outside a reasoned
+allowlist. The audit corrected seven tools (two unlisted writers, `audit_spec_coverage` now dispatched
+with `save: false`, destructive and open-world hints). Argument-validation failures are `isError`
+results that name the parameter, the expected shape, and a schema-valid corrected call, bounded and
+redacted. Output schemas (measured +19% to +96% of the substrate standing cost) and elicitation for
+decision approval are deferred to their own changes.
 
 ## Maintenance rules (what kept this table honest)
 

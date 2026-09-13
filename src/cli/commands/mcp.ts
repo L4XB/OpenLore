@@ -29,7 +29,7 @@ import { Command } from 'commander';
 // a host declined it (cli: OptionalFeatureDependenciesDegradeAtTheirOwnCommand).
 import { loadMcpSdk, OptionalFeatureError } from './optional-features.js';
 import {
-  validateToolArgs,
+  checkToolArguments,
   withToolTimeout,
   capStructuredResult,
   classifyToolError,
@@ -2295,8 +2295,11 @@ export const TOOL_DEFINITIONS = [
 const _RO  = { readOnlyHint: true,  destructiveHint: false, idempotentHint: true  } as const;
 const _RWI = { readOnlyHint: false, destructiveHint: false, idempotentHint: true  } as const;
 const _RW  = { readOnlyHint: false, destructiveHint: false, idempotentHint: false } as const;
+// Overwrites or irreversibly changes user-authored state (change: adopt-mcp-protocol-conformance).
+const _RWD  = { readOnlyHint: false, destructiveHint: true, idempotentHint: false } as const;
+const _RWDI = { readOnlyHint: false, destructiveHint: true, idempotentHint: true  } as const;
 
-const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW> = {
+const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW | typeof _RWD | typeof _RWDI> = {
   orient: _RO, analyze_codebase: _RWI, get_architecture_overview: _RO,
   prepare_spec_generation: _RO, prepare_spec_repair: _RO,
   get_refactor_report: _RO, get_call_graph: _RO, get_duplicate_report: _RO,
@@ -2307,15 +2310,18 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW> = 
   suggest_insertion_points: _RO, search_code: _RO, list_spec_domains: _RO,
   search_specs: _RO, search_unified: _RO, get_spec: _RO, get_function_body: _RO,
   explain_retrieval_miss: _RO,
-  get_file_dependencies: _RO, generate_change_proposal: _RW, annotate_story: _RW,
+  get_file_dependencies: _RO, generate_change_proposal: _RWD, annotate_story: _RWDI,
   get_route_inventory: _RO, get_middleware_inventory: _RO,
   get_schema_inventory: _RO, get_ui_component_inventory: _RO, get_env_vars: _RO,
   get_external_packages: _RO, audit_spec_coverage: _RO, generate_tests: _RW,
   get_test_coverage: _RO, get_minimal_context: _RO, get_cluster: _RO,
   detect_changes: _RO, get_health_map: _RO, get_surprising_connections: _RO, record_decision: _RW, list_decisions: _RO,
-  approve_decision: _RWI, reject_decision: _RWI, sync_decisions: _RWI,
+  approve_decision: _RWI, reject_decision: _RWDI, sync_decisions: _RWI,
   remember: _RW, recall: _RO, verify_claim: _RO,
-  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RO,
+  // Audited writers (change: adopt-mcp-protocol-conformance): `persist: true` writes a certificate,
+  // and federation_status adopts newly indexed fingerprints into the federation manifest.
+  spec_store_status: _RO, working_set_context: _RO, change_impact_certificate: _RWI, federation_status: _RWI,
+  get_landmarks: _RO, get_map: _RO, find_path: _RO,
   plan_parallel_work: _RO, map_in_flight_conflicts: _RO, get_language_support: _RO,
   report_coverage_gaps: _RO,
   certify_public_surface: _RO,
@@ -2327,9 +2333,15 @@ const TOOL_ANNOTATIONS: Record<string, typeof _RO | typeof _RWI | typeof _RW> = 
   locate_symbol_span: _RO,
 };
 
-// Tools that touch external entities (LLM / network) → openWorldHint: true.
+/** Tool names with an explicit read/write annotation entry, for the coverage guard. */
+export const ANNOTATED_TOOL_NAMES: readonly string[] = Object.keys(TOOL_ANNOTATIONS);
+
+// Tools that can reach external entities (network / LLM) → openWorldHint: true. Audited
+// (change: adopt-mcp-protocol-conformance): map_in_flight_conflicts reads pull requests through `gh`;
+// record_decision starts a background consolidation that can call an LLM. generate_tests,
+// generate_change_proposal, and annotate_story are local over MCP (no LLM service is passed).
 // Everything else is local, deterministic, closed-world analysis.
-const OPEN_WORLD_TOOLS = new Set<string>(['generate_tests', 'generate_change_proposal', 'annotate_story']);
+const OPEN_WORLD_TOOLS = new Set<string>(['map_in_flight_conflicts', 'record_decision']);
 
 /** Human-readable title from a snake_case tool name (spec-11 annotations). */
 function toolTitle(name: string): string {
@@ -2346,7 +2358,10 @@ function toolTitle(name: string): string {
 export function toolAnnotations(name: string): Record<string, unknown> {
   return {
     title: toolTitle(name),
-    ...(TOOL_ANNOTATIONS[name] ?? _RO),
+    // No fallback (change: adopt-mcp-protocol-conformance): a tool without an explicit entry carries
+    // no read/write hints, which MCP clients read as the conservative defaults (not read-only,
+    // possibly destructive) — never as read-only. `mcp-annotations.test.ts` fails CI on the gap.
+    ...(Object.prototype.hasOwnProperty.call(TOOL_ANNOTATIONS, name) ? TOOL_ANNOTATIONS[name] : {}),
     openWorldHint: OPEN_WORLD_TOOLS.has(name),
     ...(capabilityFamily(name) ? { family: capabilityFamily(name) } : {}),
   };
@@ -2634,7 +2649,6 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
     InitializeRequestSchema,
     ListToolsRequestSchema,
     McpError,
-    ErrorCode,
     LATEST_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
   } = sdk.types;
@@ -2742,6 +2756,10 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
   // Agent identity captured from initialize handshake
   let agentName = 'unknown';
   let agentVersion = 'unknown';
+  // WATCH (change: adopt-mcp-protocol-conformance): the MCP 2026-07-28 release-candidate direction
+  // (a stateless core, `initialize` removed) would bypass this custom handler, which is where the
+  // client identity, the negotiated version, the real package version, and the `instructions`
+  // pointer are set. Revisit when that revision is final; nothing is built against the draft.
   server.setRequestHandler(InitializeRequestSchema, async (request) => {
     agentName = request.params.clientInfo?.name ?? 'unknown';
     agentVersion = request.params.clientInfo?.version ?? 'unknown';
@@ -2812,22 +2830,15 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
     // persistent side effect. Unknown properties are rejected by the shared
     // guard instead of being silently discarded by handlers.
     {
-      const argError = validateToolArgs(args, toolDef.inputSchema);
-      if (argError) {
-        // Do not emit under `directory` here: it has not been validated yet, and
-        // telemetry itself creates files. A rejected request must be side-effect free.
-        throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for "${name}": ${argError}`);
-      }
-      try {
-        directory = await validateDirectory(directory);
-        (args as Record<string, unknown>).directory = directory;
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const defaultHint = hadExplicitDirectory
-          ? ''
-          : ' The server launch root could not be used; replace the placeholder in this example with an existing absolute project path: {"directory":"/absolute/path/to/project"}.';
-        throw new McpError(ErrorCode.InvalidParams, `Invalid arguments for "${name}": /directory: ${detail}.${defaultHint}`);
-      }
+      // A rejected request must be side-effect free: nothing below has run, and telemetry is not
+      // emitted under a directory that has not been validated (telemetry itself creates files).
+      // Rejections are Tool Execution Errors, not JSON-RPC -32602: hosts often swallow protocol
+      // errors, while an `isError` result reaches the model, which can retry with the example
+      // (change: adopt-mcp-protocol-conformance; SEP-1303).
+      const checked = await checkToolArguments(name, args, toolDef.inputSchema, { hadExplicitDirectory, validateDirectory });
+      if (!checked.ok) return checked.result;
+      directory = checked.directory;
+      (args as Record<string, unknown>).directory = directory;
     }
 
     if (options.watchAuto && !autoWatcher) {
@@ -3124,8 +3135,8 @@ async function startMcpServer(options: McpServerOptions = {}): Promise<void> {
 
       return { content };
     } catch (err) {
-      // A thrown McpError is a protocol-level error (e.g. -32602) — let the SDK
-      // serialize it as a JSON-RPC error response, not a tool isError result.
+      // A thrown McpError is a protocol-level error — let the SDK serialize it as a JSON-RPC
+      // error response. Argument validation no longer throws one (it returns an `isError` result).
       if (err instanceof McpError) throw err;
       // Error normalization (spec-10): a stable code taxonomy, distinguishing
       // "repo not analyzed yet" (actionable) from real failures and timeouts.
