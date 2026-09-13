@@ -29,7 +29,8 @@
 
 import { validateDirectory, readCachedContext } from './utils.js';
 import { loadTraversalIndex } from './traversal.js';
-import { deadCodeIds } from './reachability.js';
+import { deadCodeIds, wiringKey, loadExternalWiring, externalWiringCaveats } from './reachability.js';
+import type { WiringReceipt } from '../../analyzer/entry-point-adapters.js';
 import {
   loadDynamicBoundaryReport,
   loadImportAdjacency,
@@ -106,6 +107,12 @@ interface CoverageGap {
    *                                     dispatch), not evidence the code is unused.
    */
   deadReason?: DeadFlagReason;
+  /**
+   * The config receipts (file and key) that invoke this symbol's file (change:
+   * add-framework-entry-point-adapters): the reason an untested symbol with no caller is
+   * untested-not-dead rather than also-dead.
+   */
+  externallyWired?: WiringReceipt[];
 }
 
 /** Why a gap is also in the dead set. Closed set, derived — no new traversal. */
@@ -225,7 +232,10 @@ export async function handleReportCoverageGaps(input: ReportCoverageGapsInput): 
   // ── Significance labels for ranking (reused classifiers, no new score) ──────
   // Strict mode is threaded into the dead set too, so `alsoFlaggedDead` rests on
   // the SAME edge basis as the gap partition (no strict/non-strict disagreement).
-  const deadIds = await deadCodeIds(absDir, cg, { directResolvedOnly: input.directResolvedOnly });
+  // Config wiring is read once and shared with the dead set (change: add-framework-entry-point-adapters).
+  const wiring = await loadExternalWiring(absDir);
+  const wiredFiles = wiring.byFile;
+  const deadIds = await deadCodeIds(absDir, cg, { directResolvedOnly: input.directResolvedOnly, externalWiring: wiredFiles });
   // Dynamic-boundary sites (change: disclose-dynamic-boundary-regions), read once per invocation.
   const dynamicReport = await loadDynamicBoundaryReport(absDir, undefined, { directResolvedOnly: input.directResolvedOnly });
   const qualifyDynamic = buildQualifier(
@@ -244,6 +254,8 @@ export async function handleReportCoverageGaps(input: ReportCoverageGapsInput): 
       fanIn: n.fanIn ?? 0,
       signals,
     };
+    const wiredBy = wiredFiles.get(wiringKey(n.filePath));
+    if (wiredBy) gap.externallyWired = wiredBy;
     if (deadIds.has(n.id)) {
       // `also-dead` asserts the ABSENCE of any caller. A dynamic-boundary site that can name this
       // symbol is exactly the evidence that such an assertion is not established, so the label is
@@ -346,6 +358,10 @@ export async function handleReportCoverageGaps(input: ReportCoverageGapsInput): 
     // Symbol resolution prefers an exact (case-insensitive) name match but falls back
     // to substring, so a short name can scope to more than the one function intended.
     caveats.push('Symbol scope resolves by name (exact preferred, substring fallback); a short or partial symbol name may widen the scope to several functions.');
+  }
+  // The also-dead label rests on config-wired roots too (change: add-framework-entry-point-adapters).
+  if (wiring.report.wired.length > 0 || wiring.report.boundaries.length > 0 || gaps.some(g => g.alsoFlaggedDead)) {
+    caveats.push(...externalWiringCaveats(wiring.report));
   }
   // Emitted only when the returned page actually carries the reason — a caveat about
   // a signal that is not present is noise of the kind this change exists to remove.

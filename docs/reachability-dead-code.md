@@ -19,7 +19,7 @@ Static reachability **cannot see** dynamic entry points, framework magic (routes
 registries), reflection, or public API consumed *outside* the repo. All of these produce false
 "dead" positives. So `find_dead_code`:
 
-- treats **tests, imported symbols, route handlers, and `main`** as roots,
+- treats **tests, imported symbols, route handlers, `main`, and files a config invokes** as roots,
 - returns **confidence-tagged candidates with a reason**, never a verdict,
 - and **never auto-deletes**.
 
@@ -63,7 +63,40 @@ containing no dynamic dispatch.
 ## How roots and confidence work
 
 A node is a **root** (assumed live) if it is a test, is imported by name from another file, is a
-detected HTTP route handler, or is `main`-like. Reachability is a forward BFS from those roots.
+detected HTTP route handler, is `main`-like, or lives in a file a config invokes. Reachability is a
+forward BFS from those roots.
+
+### Config-wired roots
+
+Code that only configuration invokes has no importer, so without evidence it reads as orphaned
+(change: `add-framework-entry-point-adapters`). Deterministic adapters read:
+
+| Config | What counts as wiring |
+|---|---|
+| root `package.json` | `bin`, `main`, `module`, `exports` targets; files run by `scripts`; `jest` setup files |
+| `tsconfig.json` | `files`; `outDir` → `rootDir` maps a build output (`dist/cli/index.js`) back to its source |
+| `vitest`/`vite`/`jest` config | literal `setupFiles` / `globalSetup` values |
+| `.github/workflows/*.yml` | files run by `run:` steps, relative to the step's `working-directory` |
+
+A command wires a file only when it **executes** it: the script after a runner (`node`, `tsx`,
+`python`, `bash`, …, past wrappers such as `cross-env` or `npx`), a `--require` / `--import` preload,
+or a path in command position. A path passed as an argument (`eslint src/x.ts`), a redirect target
+(`> dist/out.js`), or heredoc content is not wiring.
+
+Every function in a wired file becomes an `externally-wired` root: the graph has no node for
+module-scope code, so a wired file's load-time calls cannot be told from its helpers, and the bias
+stays false-live over false-dead. The report counts them in `rootKinds.externallyWired` and lists each
+wired file with its receipts (config file and key) in `externalWiring.files`.
+
+A reference the adapters cannot resolve is listed in `externalWiring.boundaries` with a reason and
+counted in a caveat, never guessed: `dynamic-reference` (a variable, `${{ }}` expression, or glob),
+`unsupported-form` (a module run by name, a path after a `cd`, or a config with too many references),
+`target-not-found`, `build-output-unmapped` (a build output tsconfig does not map to a source),
+`outside-repository`, `unreadable-config` (a link, a non-regular file, or one over 1 MB), and
+`unparsed-config`. Workspace-member manifests,
+framework routing conventions, and other config formats are not read, and only POSIX shell
+workflow steps are tokenized (a PowerShell or cmd step is an `unsupported-form` boundary). On this
+repository, 36 of 1,018 entry points are in config-wired files.
 
 Confidence is deliberately conservative — the bias is toward **false-live over false-dead**:
 
@@ -104,7 +137,11 @@ Report output:
 ```jsonc
 {
   "stats": { "analyzed": 1455, "roots": 399, "reachable": 790, "candidateDead": 665 },
-  "rootKinds": { "tests": 0, "imported": 393, "httpHandlers": 0 },
+  "rootKinds": { "tests": 0, "imported": 393, "httpHandlers": 0, "externallyWired": 4 },
+  "externalWiring": {
+    "files": [{ "file": "src/cli/index.ts", "receipts": [{ "config": "package.json", "key": "bin.openlore" }], "roots": 4 }],
+    "boundaries": [{ "config": "package.json", "key": "scripts.run", "reference": "$SCRIPT", "reason": "dynamic-reference" }]
+  },
   "byConfidence": { "high": 35, "medium": 35, "low": 595 },
   "candidateDead": [
     { "name": "isValidEmail", "file": "src/utils/validation.ts", "language": "TypeScript",
@@ -134,7 +171,7 @@ Pure read over the existing graph — **no schema change**:
 - **Reachability** — forward BFS over [`buildAdjacency`](../src/core/services/mcp-handlers/graph.ts)'s
   forward map from the root set; candidate-dead = code nodes not reached. External and
   infrastructure (IaC) nodes are excluded.
-- **Liveness signals** — tests + HTTP route handlers + `main`, plus the dependency graph's
+- **Liveness signals** — tests + HTTP route handlers + `main` + config-wired files, plus the dependency graph's
   imported names (symbol-level) and imported files (module-level) for the cross-language
   "used elsewhere" signal.
 - **Delete-impact** — recompute reachability with the target removed from both seeds and the

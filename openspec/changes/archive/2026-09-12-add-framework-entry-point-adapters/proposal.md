@@ -1,6 +1,6 @@
 # Framework entry-point adapters: config-wired code stops reading as orphaned
 
-> Status: PROPOSED (2026-07-03, e2e audit follow-up). Deterministic config-file readers that mark
+> Status: BUILT (2026-09-12), narrowed — see *Scope as built*. Originally PROPOSED (2026-07-03, e2e audit follow-up). Deterministic config-file readers that mark
 > files/symbols as externally referenced — package.json `bin`/`main`/`exports`, npm scripts, test
 > runner configs, CI workflow `run:` steps — so wiring that never appears as an import stops
 > inflating entry-point and dead-code candidates. Prior art: knip (https://knip.dev/), whose ~150
@@ -60,12 +60,51 @@ from knip: its `--fix` auto-deletion (nothing is ever auto-deleted — `reachabi
 JS-ecosystem-only scope framing, and the 150-plugin ambition — adapters stay a small set of
 format parsers, each deterministic and individually testable.
 
+## Scope as built
+
+- **Built:** one module, `src/core/analyzer/entry-point-adapters.ts` (not a directory), with three
+  stages:
+  - the root `package.json` (`bin`, `main`, `module`, `exports`, `scripts`, `jest`), with a build
+    output tried first as its source through tsconfig `outDir` → `rootDir`;
+  - `tsconfig.json` `files` and literal vitest/vite/jest `setupFiles` / `setupFilesAfterEnv` /
+    `globalSetup` values (comments stripped, `<rootDir>` expanded);
+  - `.github/workflows` `run:` steps, parsed again with the workflow parser's `${{ }}` masking (not
+    through its step handling), relative to each step's working directory.
+- **Commands** count only executed files: the script after a runner (past wrappers such as `cross-env`
+  or `npx`, shell keywords, subshells, and brace groups), a `--require`/`--import` preload, or a relative
+  path in command position, using each runner's own value and inline flags; a bare name is tried as the
+  runner would resolve it (`node build` → `build.js`), a `cd` holds only within its subshell, and
+  `sh -c` contents are read as a command. Arguments, redirect
+  targets, heredoc bodies, package scripts run by name, and `node_modules` tools are ignored; a
+  variable, glob, `-m module`, or path after `cd` is a boundary.
+- **Reading** uses the no-follow, non-blocking bounded reader (a FIFO or linked config is an
+  `unreadable-config` boundary), parses YAML without merge keys, scans test-runner values in linear
+  time, deduplicates and caps references and boundaries per config with a disclosure, and memoizes
+  resolution. These are bounding constants, not tuning constants.
+- **Roots:** every function in a wired file is an `externally-wired` root, stated in the caveats of
+  `find_dead_code` and `report_coverage_gaps`.
+- **Consumers:** `find_dead_code` (`rootKinds.externallyWired`, `externalWiring` receipts and
+  boundaries, caveats), `report_coverage_gaps` (`externallyWired` receipts on a gap; the label is the
+  existing absence of `alsoFlaggedDead`), `verify_claim` and landmarks (the shared dead set), and the
+  CODEBASE.md entry-point line (in files a config invokes vs. invoked by no config read). CODEBASE.md
+  changes only on `analyze`; the query tools read config on every call.
+- **Measured on this repository:** 36 of 1,018 entry points are in files a config invokes; 24 files are
+  wired (for example `src/cli/index.ts` by `bin.openlore`, `exports["./cli"]`, and three scripts); 9
+  boundaries, all PowerShell workflow steps disclosed as `unsupported-form`. Six public repositories
+  reviewed before the tokenizer fixes (commander.js, execa, click, httpx, antfu/ni, tsup): every symbol
+  that left the candidate set was genuinely config-invoked.
+- **Shells:** only POSIX (`bash`/`sh`) steps are tokenized; a PowerShell or cmd step, including a
+  Windows runner's default shell, is one `unsupported-form` boundary.
+- **Dropped or deferred:** tsconfig `references` (they name projects, not code files), stage-2
+  include globs (they select test files, which are already roots), workspace-member manifests,
+  framework route conventions, a map-view decomposition, and a `cd`-tracking shell model.
+
 ## Why this is in scope
 
 `find_dead_code`'s candidates and the entry-point inventory are existing conclusions whose
 largest disclosed error source is config wiring; closing it with deterministic file readers is
 precision work on the substrate's own doctrine (candidates → fewer, receipted candidates), with
-zero new surface and zero constants.
+zero new surface and no tuning constants (only read bounds).
 
 ## Impact
 

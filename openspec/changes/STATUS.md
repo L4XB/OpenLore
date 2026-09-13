@@ -43,7 +43,7 @@ requirements reflected in the main specs. `openspec list` shows only open work.
 A change belongs here the moment its implementation starts; move it back out (archive it) the
 moment its marker/spec evidence lands.
 
-## To build — 101
+## To build — 100
 
 The whole open set is unbuilt backlog. Newest additions: 7 proposals from the 2026-07-27
 first-run e2e (`E2E-FIRSTRUN-2026-07-27.md`). Other thematic indexes:
@@ -116,7 +116,6 @@ trust boundary for served content.
 | `add-edit-loop-breakage-verdict` | The graph learns about a breaking edit in milliseconds; the agent learns at commit time |
 | `add-enforcement-baseline-ratchet` | a `frozen` class that blocks only NEW findings |
 | `add-flag-impact-analysis` | Piranha's deterministic kernel, no rewriter |
-| `add-framework-entry-point-adapters` | config-wired code stops reading as orphaned |
 | `add-incremental-bundle-delta` | apply a stale ancestor bundle, then re-analyze only the delta |
 | `add-incremental-early-cutoff` | unchanged extracted facts stop the invalidation cascade |
 | `add-knowledge-map-and-coupling-upgrades` | bus factor, temporal aggregation, ticket-ID grouping |
@@ -235,6 +234,16 @@ with `save: false`, destructive and open-world hints). Argument-validation failu
 results that name the parameter, the expected shape, and a schema-valid corrected call, bounded and
 redacted. Output schemas (measured +19% to +96% of the substrate standing cost) and elicitation for
 decision approval are deferred to their own changes.
+
+Shipped and archived since: `add-framework-entry-point-adapters` (2026-09-12, narrowed) — deterministic
+readers of the root package.json, tsconfig files, vitest/vite/jest setup files, and POSIX-shell GitHub
+Actions `run:` steps make every function in a file a config executes an `externally-wired` liveness
+root with a receipt, in `find_dead_code`, the shared dead set, `report_coverage_gaps`, and the
+entry-point digest. A shell tokenizer counts only executed files (never arguments, redirects, or
+heredoc bodies); variables, globs, `cd`, modules by name, PowerShell steps, and unreadable configs are
+reasoned boundaries. Four adversarial reviews plus a fix-verification review hardened it against false
+wiring, FIFO hangs, a YAML merge-key bomb, quadratic scans, and unbounded boundary growth. On this
+repository 36 of 1,018 entry points are config-invoked.
 
 ## Maintenance rules (what kept this table honest)
 
