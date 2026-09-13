@@ -38,15 +38,34 @@ import {
   classifySignatureChange,
   signatureClassifiable,
   overallClass,
+  suggestedBump,
+  BREAKING_SURFACE_RULE_CODES,
   type SurfaceChange,
   type SurfaceKind,
   type ChangeClass,
+  type SuggestedBump,
 } from '../../analyzer/public-surface.js';
+import { FINDING_CODE_REGISTRY, type GovernanceFinding } from './enforcement-policy.js';
 
 
 const MAX_SURFACE = 500;
 const MAX_CONSUMERS = 25;
 const SOURCE_RE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py)$/i;
+/** Code extensions the canonical language map does not know (C/C++ headers, Python stubs, …). */
+const EXTRA_CODE_RE = /\.(pyi|pyx|pxd|pyw|hxx|hh|inl|ipp|tpp|cu|cuh|mm|m|fs|fsi|fsx|vb|erl|hrl|clj|cljs|cljc|hs|lhs|ml|mli|zig|nim|jl|r|groovy|razor|cshtml|erb|rake|gemspec|coffee|pl|pm|ps1|psm1|zsh|fish|bat|cmd|sol|elm|purs|gleam|cr|hx|tcl|wat|move)$/i;
+
+/**
+ * A code file in a language whose public signatures are not classified. It never reaches the
+ * classifier, so a diff that changes one cannot earn a `minor`/`patch` bump on its evidence. Built
+ * from the canonical language map (so a Vue or shell file counts) plus a few extensions it does not
+ * know; infrastructure files (Terraform, Bicep), tests, and non-code files do not count.
+ */
+function isUnclassifiedCode(path: string): boolean {
+  if (SOURCE_RE.test(path) || isTestFile(path)) return false;
+  const language = detectLanguage(path);
+  if (language === 'Terraform' || language === 'Bicep') return false;
+  return language !== 'unknown' || EXTRA_CODE_RE.test(path);
+}
 
 export interface CertifyPublicSurfaceInput {
   directory: string;
@@ -366,12 +385,16 @@ async function listSurface(absDir: string, ctx: Awaited<ReturnType<typeof readCa
   };
 }
 
-async function changedSourceFiles(absDir: string, base: string): Promise<Array<{ path: string; oldPath?: string; status: string }>> {
+async function changedSourceFiles(absDir: string, base: string): Promise<{ files: Array<{ path: string; oldPath?: string; status: string }>; unassessedCodeFiles: number }> {
   const { getChangedFiles } = await import('../../drift/git-diff.js');
   const diff = await getChangedFiles({ rootPath: absDir, baseRef: base, includeUnstaged: true });
   // A test file is not part of the public API surface — exclude it (it also tends to embed
   // `export …` strings in fixtures that would otherwise read as phantom contract symbols).
   const eligible = (p: string): boolean => SOURCE_RE.test(p) && !isTestFile(p);
+  const unassessed = new Set<string>();
+  const noteUnassessed = (p: string): void => { if (isUnclassifiedCode(p)) unassessed.add(p); };
+  // A rename counts both names: `lib.go` → `lib.txt` removes Go code the classifier never read.
+  for (const f of diff.files) { noteUnassessed(f.path); if (f.oldPath) noteUnassessed(f.oldPath); }
   const out = diff.files
     .filter((f) => eligible(f.path))
     .map((f) => ({ path: f.path, status: f.status as string, ...(f.oldPath ? { oldPath: f.oldPath } : {}) }));
@@ -380,9 +403,10 @@ async function changedSourceFiles(absDir: string, base: string): Promise<Array<{
     const { stdout } = await execFileAsync('git', gitPathArgs('ls-files', '--others', '--exclude-standard'), { cwd: absDir, maxBuffer: 16 * 1024 * 1024 });
     for (const path of stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
       if (eligible(path) && !seen.has(path)) { seen.add(path); out.push({ path, status: 'added' }); }
+      noteUnassessed(path);
     }
   } catch { /* best-effort */ }
-  return out;
+  return { files: out, unassessedCodeFiles: unassessed.size };
 }
 
 async function diffSurface(
@@ -403,7 +427,7 @@ async function diffSurface(
   const resolvedBase = base.resolved;
   const oldRef = await mergeBase(absDir, resolvedBase);
 
-  const changed = await changedSourceFiles(absDir, resolvedBase);
+  const { files: changed, unassessedCodeFiles } = await changedSourceFiles(absDir, resolvedBase);
   // Read base + head content for every changed file.
   const baseFiles: Array<{ path: string; content: string; language: string }> = [];
   const headFiles: Array<{ path: string; content: string; language: string }> = [];
@@ -423,7 +447,7 @@ async function diffSurface(
   const headPathOf = new Map<string, string>();
   for (const f of changed) if (f.oldPath) headPathOf.set(f.oldPath, f.path);
 
-  const { extraCrossings, ...diff } = await assembleSurfaceDiff(baseFiles, headFiles, headPathOf, ctx?.edgeStore as EdgeStoreLike | undefined);
+  const { extraCrossings, ...diff } = await assembleSurfaceDiff(baseFiles, headFiles, headPathOf, ctx?.edgeStore as EdgeStoreLike | undefined, unassessedCodeFiles);
   return {
     mode: 'diff',
     base: resolvedBase,
@@ -447,11 +471,17 @@ export async function assembleSurfaceDiff(
   headFiles: Array<{ path: string; content: string; language: string }>,
   headPathOf: Map<string, string>,
   edgeStore?: EdgeStoreLike,
+  /** Changed code files in a language whose signatures are not classified (they never reach this core). */
+  unassessedCodeFiles = 0,
 ): Promise<{
   overall: ChangeClass;
   summary: { breaking: number; potentiallyBreaking: number; nonBreaking: number };
   changes: SurfaceChange[];
   breaking: Array<SurfaceChange & { consumers: Consumer[]; consumersTruncated: number }>;
+  suggestedBump: SuggestedBump | null;
+  /** Why the bump is withheld, when `suggestedBump` is null. */
+  suggestedBumpWithheld?: string;
+  findings: GovernanceFinding[];
   soundness: { posture: string; languages: string };
   extraCrossings: Array<{ kind: 'unindexed-repo'; count: number; detail: string }>;
 }> {
@@ -472,7 +502,7 @@ export async function assembleSurfaceDiff(
   for (const [key, head] of headByKey) {
     const base = baseByKey.get(key);
     if (!base) { addedFns.push(head); continue; }
-    const { class: cls, reasons } = classifySignatureChange(base.signature, head.signature, head.language);
+    const { class: cls, reasons, ruleCodes } = classifySignatureChange(base.signature, head.signature, head.language);
     if (cls === 'non-breaking' && reasons.length === 0) continue; // unchanged contract
     changes.push({
       changeKind: 'signature',
@@ -483,6 +513,7 @@ export async function assembleSurfaceDiff(
       before: base.signature,
       after: head.signature,
       reasons,
+      ruleCodes,
     });
   }
   // Symbols only in base → removed (candidate rename source).
@@ -508,6 +539,7 @@ export async function assembleSurfaceDiff(
       before: base.signature,
       after: pair.to.id.slice(pair.to.id.lastIndexOf('::') + 2),
       reasons: [`exported symbol renamed to "${pair.to.name}" (${pair.reason}, basis: ${pair.basis})`],
+      ruleCodes: ['export-renamed'],
       rename: { to: pair.to.name, file: pair.to.filePath, reason: pair.reason, basis: pair.basis },
     });
   }
@@ -529,6 +561,7 @@ export async function assembleSurfaceDiff(
       reasons: [stillDefined
         ? 'exported symbol is still defined but no longer exported (visibility reduced: public → private)'
         : 'exported symbol was removed from the public surface'],
+      ruleCodes: [stillDefined ? 'export-visibility-reduced' : 'export-removed'],
     });
   }
 
@@ -543,6 +576,7 @@ export async function assembleSurfaceDiff(
       kind: kindFromSignature(head.signature),
       after: head.signature,
       reasons: ['new export added to the public surface'],
+      ruleCodes: ['export-added'],
     });
   }
 
@@ -580,6 +614,7 @@ export async function assembleSurfaceDiff(
         file: path,
         kind: 'unknown',
         reasons: ['exported symbol was removed from the public surface (no signature available — non-function or aliased export)'],
+        ruleCodes: ['export-removed'],
       });
     }
     for (const name of headN) {
@@ -591,6 +626,7 @@ export async function assembleSurfaceDiff(
         file: path,
         kind: 'unknown',
         reasons: ['new export added to the public surface'],
+        ruleCodes: ['export-added'],
       });
     }
   }
@@ -617,7 +653,7 @@ export async function assembleSurfaceDiff(
     ? [{
         kind: 'unindexed-repo' as const,
         count: breaking.length,
-        detail: 'Consumers of these breaking changes that live OUTSIDE any indexed repo (closed-source or external downstreams) are not visible; the listed consumers are in-repo only. Under federation, indexed sibling repos are also checked.',
+        detail: 'Consumers of these breaking changes that live OUTSIDE any indexed repo (closed-source or external downstreams) are not visible; the listed consumers are in-repo only. Consumers in sibling repositories are not checked, including under federation.',
       }]
     : [];
 
@@ -630,6 +666,8 @@ export async function assembleSurfaceDiff(
     },
     changes,
     breaking,
+    ...bumpVerdict(changes, unassessedCodeFiles === 0 && (anyClassifiable || (baseFiles.length === 0 && headFiles.length === 0)), unassessedCodeFiles),
+    findings: publicSurfaceFindings(changes),
     soundness: {
       posture: anyClassifiable
         ? 'Compatibility is classified from statically-available signatures; anything unprovable is potentially-breaking, never silently safe.'
@@ -638,6 +676,55 @@ export async function assembleSurfaceDiff(
     },
     extraCrossings,
   };
+}
+
+const BREAKING_CODE_SET: ReadonlySet<string> = new Set(BREAKING_SURFACE_RULE_CODES);
+
+/** The suggested bump plus, when it is withheld, the reason. */
+function bumpVerdict(changes: readonly SurfaceChange[], signaturesAssessed: boolean, unassessedCodeFiles: number): { suggestedBump: SuggestedBump | null; suggestedBumpWithheld?: string } {
+  const bump = suggestedBump(changes, signaturesAssessed);
+  if (bump !== null) return { suggestedBump: bump };
+  const unproven = changes.filter((c) => c.class === 'potentially-breaking').length;
+  return {
+    suggestedBump: null,
+    suggestedBumpWithheld: unproven > 0
+      ? `${unproven} change(s) could not be proven compatible (potentially-breaking)`
+      : unassessedCodeFiles > 0
+        ? `${unassessedCodeFiles} changed code file(s) are in a language whose signatures are not classified (for example Go or Rust), so compatibility was not assessed`
+        : 'the changed files are in no signature-classifiable language, so compatibility was not assessed',
+  };
+}
+
+/**
+ * Governance findings for a surface diff, one per rule code per changed symbol, so an
+ * `enforcement.policy` can gate an individual rule (for example block `export-removed` but not
+ * `param-type-narrowed`). Breaking-classed codes are severity `error`; `signature-unprovable` is a
+ * `warning` a caller can choose to gate, so removing a type annotation cannot hide a narrowing from
+ * a policy. `export-added` is not a finding. Deterministic order (the changes are already sorted).
+ */
+export function publicSurfaceFindings(changes: readonly SurfaceChange[]): GovernanceFinding[] {
+  const findings: GovernanceFinding[] = [];
+  for (const change of changes) {
+    for (const code of change.ruleCodes) {
+      const breaking = BREAKING_CODE_SET.has(code);
+      if (!breaking && code !== 'signature-unprovable') continue;
+      const subject = `${change.file}::${change.name}`;
+      findings.push({
+        code,
+        severity: breaking ? 'error' : 'warning',
+        source: 'public-surface',
+        subject,
+        // The reasons stay on the change itself; a finding names the rule, so a large diff does not
+        // repeat every reason a third time in the response.
+        message: `${change.changeKind} of exported "${change.name}" ${breaking ? 'breaks' : 'triggers'} rule ${code}`,
+        // A function replacement: a subject such as `app/routes/$$id.tsx` must not be read as a `$` pattern.
+        remediation: FINDING_CODE_REGISTRY[code]?.remediation?.replace('{subject}', () => subject),
+        // A rename's finding points at the file that exists after the change.
+        location: { path: change.rename?.file ?? change.file },
+      });
+    }
+  }
+  return findings;
 }
 
 export async function computeCertifyPublicSurface(input: CertifyPublicSurfaceInput): Promise<unknown> {

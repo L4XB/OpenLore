@@ -103,6 +103,7 @@ trust boundary for served content.
 
 | Change | What it is |
 |---|---|
+| `add-public-surface-acceptance-baseline` | accepted-breakage baseline with required justifications, and consumer-weighted breaking verdicts (split out of refine-public-surface-certification) |
 | `add-assumption-anchored-resolutions` | a governed way to answer a disclosed boundary |
 | `add-benchmark-harness-protocol` | A checked-in benchmark protocol for default-surface decisions |
 | `add-build-graph-ingest` | declared monorepo target structure as provenance-tagged evidence |
@@ -168,7 +169,6 @@ trust boundary for served content.
 | `optimize-serving-hot-path-caches` | The default tools rebuild derived graph structures and re-parse multi-MB artifacts on every call, and re-scan the whole corpus per keyword search |
 | `promote-backed-language-visibility` | the generated matrix discloses its scope, the docs get one canonical page |
 | `refine-first-run-partial-serving` | minutes of "no index found" before the first answer |
-| `refine-public-surface-certification` | rule codes + semver bump, an accepted-breakage baseline, consumer-weighted verdicts |
 | `resolve-literal-reflective-dispatch` | recover the *structurally* decidable subset, and refuse the rest loudly |
 | `scale-analyze-to-workspace-shards` | a monorepo stops paying for the whole repo on every analyze |
 | `shrink-traversal-index-invalidation-scope` | The traversal structure is invalidated by edits it does not depend on |
@@ -284,6 +284,16 @@ so a local `info/attributes` cannot hide a rule (a twenty-second round), submodu
 response-size loop. A missing or criss-cross
 merge base, a PR head that is not local, an agent task, a cross-repo pair, or a cap is
 `not-assessed`, never clean. Per-symbol hunk mapping is deferred.
+
+Shipped and archived since: `refine-public-surface-certification` (2026-09-13, narrowed) —
+`certify_public_surface` diff verdicts carry stable rule codes per change (`export-removed`,
+`param-type-narrowed`, …, `signature-unprovable`, `export-added`) and a `suggestedBump`
+(major/minor/patch as a total function of the classification). The eight breaking-classed codes are
+registered findings (source `public-surface`) emitted in `findings[]`, so a policy gates individual
+rules; `signature-unprovable` is never breaking-classed. The false "sibling repos are also checked"
+disclosure now states in-repo only. The bump is withheld when compatibility is unproven, and `signature-unprovable` is a warning finding.
+Deferred to `add-public-surface-acceptance-baseline`: the `--accept` baseline and the consumed/unconsumed
+split with the federation consumer union. `openlore enforce` does not run the tool.
 
 ## Maintenance rules (what kept this table honest)
 

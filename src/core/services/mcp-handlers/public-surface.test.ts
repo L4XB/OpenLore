@@ -1,8 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { execFileGitSync } from '../../../utils/git-exec.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assembleSurfaceDiff, computeCertifyPublicSurface } from './public-surface.js';
+import { assembleSurfaceDiff, computeCertifyPublicSurface, publicSurfaceFindings } from './public-surface.js';
+import { getChangedFiles } from '../../drift/git-diff.js';
+import { FINDING_CODE_REGISTRY, resolveEnforcementClass } from './enforcement-policy.js';
+import { BREAKING_SURFACE_RULE_CODES } from '../../analyzer/public-surface.js';
 
 // Mock only the two utils the handler reads; the pure assembleSurfaceDiff core below
 // does not touch them, so the existing suite is unaffected. git-diff is imported
@@ -296,6 +300,51 @@ describe('handleCertifyPublicSurface — base-ref is fatal on non-resolution (fi
     expect(r.baseRefFallback).toEqual({ requested: 'bogus-ref', resolved: 'main' });
   });
 
+  it('withholds the bump when a changed code file is in a language the classifier does not read', async () => {
+    vi.mocked(getChangedFiles).mockResolvedValueOnce({ files: [{ path: 'pkg/a.go', status: 'modified' }], resolvedBase: 'main' } as never);
+    const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
+    expect(r.mode).toBe('diff');
+    expect(r.suggestedBump).toBeNull();
+    expect(r.suggestedBumpWithheld).toMatch(/1 changed code file\(s\) are in a language whose signatures are not classified/);
+  });
+
+  it.each([
+    [{ path: 'src/Button.vue', status: 'modified' }],
+    [{ path: 'pkg/api.pyi', status: 'modified' }],
+    [{ path: 'pkg/_speedups.pyx', status: 'modified' }],
+    [{ path: 'scripts/release.sh', status: 'modified' }],
+    [{ path: 'lib.txt', oldPath: 'lib.go', status: 'renamed' }],
+  ])('withholds the bump for an unclassified code file: %o', async (file) => {
+    vi.mocked(getChangedFiles).mockResolvedValueOnce({ files: [file], resolvedBase: 'main' } as never);
+    const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
+    expect(r.suggestedBump).toBeNull();
+  });
+
+  it.each([
+    [{ path: 'pkg/a_test.go', status: 'modified' }],
+    [{ path: 'infra/main.tf', status: 'modified' }],
+    [{ path: 'infra/main.bicep', status: 'modified' }],
+    [{ path: 'package.json', status: 'modified' }],
+  ])('does not withhold the bump for a test, infrastructure, or config file: %o', async (file) => {
+    vi.mocked(getChangedFiles).mockResolvedValueOnce({ files: [file], resolvedBase: 'main' } as never);
+    const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
+    expect(r.suggestedBump).toBe('patch');
+  });
+
+  it('counts an untracked code file in an unclassified language', async () => {
+    execFileGitSync('git', ['init', '-q', dir]);
+    await writeFile(join(dir, 'new.go'), 'package x\nfunc New() {}\n');
+    const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
+    expect(r.suggestedBump).toBeNull();
+    expect(r.suggestedBumpWithheld).toMatch(/1 changed code file/);
+  });
+
+  it('a docs-only change still gets a patch bump (non-code files do not withhold it)', async () => {
+    vi.mocked(getChangedFiles).mockResolvedValueOnce({ files: [{ path: 'README.md', status: 'modified' }], resolvedBase: 'main' } as never);
+    const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
+    expect(r.suggestedBump).toBe('patch');
+  });
+
   it('a resolvable --base produces a verdict with no fallback disclosure', async () => {
     const r = (await computeCertifyPublicSurface({ directory: dir, baseRef: 'HEAD' })) as Record<string, unknown>;
     expect(r.error).toBeUndefined();
@@ -303,3 +352,116 @@ describe('handleCertifyPublicSurface — base-ref is fatal on non-resolution (fi
     expect(r.baseRefFallback).toBeUndefined();
   });
 });
+
+describe('rule codes, suggested bump, and findings (refine-public-surface-certification)', () => {
+  it('attaches a rule code to each change kind', async () => {
+    const base = [ts('a.ts', 'export function gone(): void {}\nexport function hidden(): void {}\nexport function keep(a: string | number): void {}\n')];
+    const head = [ts('a.ts', 'function hidden(): void {}\nexport function keep(a: string): void {}\nexport function fresh(): void {}\n')];
+    const r = await assembleSurfaceDiff(base, head, noRename);
+    expect(change(r, 'gone')?.ruleCodes).toEqual(['export-removed']);
+    expect(change(r, 'hidden')?.ruleCodes).toEqual(['export-visibility-reduced']);
+    expect(change(r, 'keep')?.ruleCodes).toEqual(['param-type-narrowed']);
+    expect(change(r, 'fresh')?.ruleCodes).toEqual(['export-added']);
+    expect(r.suggestedBump).toBe('major');
+  });
+
+  it('suggests minor for an additive diff, and withholds the bump when compatibility is unproven', async () => {
+    const additive = await assembleSurfaceDiff([ts('a.ts', 'export function a(): void {}\n')], [ts('a.ts', 'export function a(): void {}\nexport function b(): void {}\n')], noRename);
+    expect(additive.suggestedBump).toBe('minor');
+    expect(additive.findings).toEqual([]);
+    const unproven = await assembleSurfaceDiff([ts('a.ts', 'export function a(x: string): void {}\n')], [ts('a.ts', 'export function a(x): void {}\nexport function b(): void {}\n')], noRename);
+    expect(unproven.overall).toBe('potentially-breaking');
+    expect(unproven.suggestedBump).toBeNull();
+    expect(unproven.suggestedBumpWithheld).toMatch(/1 change\(s\) could not be proven compatible/);
+    expect(unproven.findings.map((f) => [f.code, f.severity])).toEqual([['signature-unprovable', 'warning']]);
+    const go = await assembleSurfaceDiff([{ path: 'a.go', content: 'package a\nfunc Gone() {}\n', language: 'Go' }], [{ path: 'a.go', content: 'package a\n', language: 'Go' }], noRename);
+    expect(go.suggestedBump).toBeNull();
+    expect(go.suggestedBumpWithheld).toMatch(/no signature-classifiable language/);
+  });
+
+  it('emits one registered finding per breaking rule code, gateable per rule', async () => {
+    const base = [ts('a.ts', 'export function gone(): void {}\nexport function keep(a: string | number): void {}\n')];
+    const head = [ts('a.ts', 'export function keep(a: string): void {}\n')];
+    const r = await assembleSurfaceDiff(base, head, noRename);
+    expect(r.findings.map((f) => [f.code, f.subject])).toEqual([['export-removed', 'a.ts::gone'], ['param-type-narrowed', 'a.ts::keep']]);
+    for (const f of r.findings) {
+      expect(FINDING_CODE_REGISTRY[f.code]?.source).toBe('public-surface');
+      expect(f.remediation).toContain(f.subject);
+    }
+    const policy = { 'export-removed': 'blocking' as const };
+    const classes = Object.fromEntries(r.findings.map((f) => [f.code, resolveEnforcementClass(f.code, policy)]));
+    expect(classes).toEqual({ 'export-removed': 'blocking', 'param-type-narrowed': 'advisory' });
+  });
+
+  it('keeps a subject containing $ patterns intact in the remediation', () => {
+    const [finding] = publicSurfaceFindings([{ changeKind: 'removed', class: 'breaking', name: 'loader', file: 'app/routes/$$id.$&.tsx', kind: 'function', reasons: [], ruleCodes: ['export-removed'] }]);
+    expect(finding.subject).toBe('app/routes/$$id.$&.tsx::loader');
+    expect(finding.remediation).toContain('app/routes/$$id.$&.tsx::loader');
+    expect(finding.message).toBe('removed of exported "loader" breaks rule export-removed');
+  });
+
+  it('registers every rule code that is a finding, as advisory, and pins a finding exactly', () => {
+    for (const code of [...BREAKING_SURFACE_RULE_CODES, 'signature-unprovable']) {
+      expect(FINDING_CODE_REGISTRY[code]).toMatchObject({ defaultClass: 'advisory', source: 'public-surface' });
+    }
+    expect(FINDING_CODE_REGISTRY['export-added']).toBeUndefined();
+    expect(publicSurfaceFindings([{ changeKind: 'signature', class: 'potentially-breaking', name: 'x', file: 'a.ts', kind: 'function', reasons: [], ruleCodes: ['signature-unprovable'] }])).toEqual([{
+      code: 'signature-unprovable',
+      severity: 'warning',
+      source: 'public-surface',
+      subject: 'a.ts::x',
+      message: 'signature of exported "x" triggers rule signature-unprovable',
+      remediation: 'Unprovable signature change: a.ts::x; restore the type annotations so compatibility can be classified, or review consumers by hand.',
+      location: { path: 'a.ts' },
+    }]);
+  });
+
+  it('carries export-renamed on a rename, name-level export codes, and parameter codes through the handler', async () => {
+    const renameBase = [ts('a.ts', 'export function oldName(x: number): number { const y = x * 2; return y + 1; }\n')];
+    const renameHead = [ts('a.ts', 'export function newName(x: number): number { const y = x * 2; return y + 1; }\n')];
+    const renamed = await assembleSurfaceDiff(renameBase, renameHead, noRename);
+    const rename = renamed.changes.find((c) => c.changeKind === 'renamed');
+    expect(rename?.ruleCodes).toEqual(['export-renamed']);
+    expect(renamed.findings.map((f) => f.code)).toEqual(['export-renamed']);
+    // A rename into another file points the finding at the file that exists after the change.
+    const moved = await assembleSurfaceDiff(
+      [ts('old.ts', 'export function computeTax(x: number): number { const y = x * 2; return y + 1; }\n')],
+      [ts('new.ts', 'export function calcTax(x: number): number { const y = x * 2; return y + 1; }\n')],
+      new Map([['old.ts', 'new.ts']]),
+    );
+    const movedFinding = moved.findings.find((f) => f.code === 'export-renamed');
+    expect(movedFinding?.location).toEqual({ path: 'new.ts' });
+
+    const consts = await assembleSurfaceDiff([ts('c.ts', 'export const GONE = 1;\n')], [ts('c.ts', 'export const FRESH = 2;\n')], noRename);
+    expect(change(consts, 'GONE')?.ruleCodes).toEqual(['export-removed']);
+    expect(change(consts, 'FRESH')?.ruleCodes).toEqual(['export-added']);
+
+    const params = await assembleSurfaceDiff(
+      [ts('p.ts', 'export function f(a: number, b?: string, c: boolean): void {}\n')],
+      [ts('p.ts', 'export function f(a: number, b: string): void {}\n')],
+      noRename,
+    );
+    // Codes follow parameter order: `b` became required (position 2), then `c` was removed (position 3).
+    expect(change(params, 'f')?.ruleCodes).toEqual(['param-became-required', 'param-removed']);
+    const added = await assembleSurfaceDiff([ts('q.ts', 'export function g(a: number): void {}\n')], [ts('q.ts', 'export function g(a: number, b: string): void {}\n')], noRename);
+    expect(added.findings.map((f) => f.code)).toEqual(['param-required-added']);
+  });
+
+  it('a change that is both breaking and unprovable emits an error and a warning finding', async () => {
+    const r = await assembleSurfaceDiff(
+      [ts('m.ts', 'export function m(a: string, b: number): void {}\n')],
+      [ts('m.ts', 'export function m(a): void {}\n')],
+      noRename,
+    );
+    expect(r.findings.map((f) => [f.code, f.severity])).toEqual([['signature-unprovable', 'warning'], ['param-removed', 'error']]);
+    expect(r.suggestedBump).toBe('major');
+  });
+
+  it('does not claim sibling repositories are checked', async () => {
+    const r = await assembleSurfaceDiff([ts('a.ts', 'export function gone(): void {}\n')], [ts('a.ts', '\n')], noRename);
+    const detail = r.extraCrossings.map((c) => c.detail).join(' ');
+    expect(detail).not.toMatch(/sibling repos are also checked/i);
+    expect(detail).toMatch(/not checked, including under federation/);
+  });
+});
+

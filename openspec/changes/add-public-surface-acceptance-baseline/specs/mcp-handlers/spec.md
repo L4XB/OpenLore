@@ -2,38 +2,6 @@
 
 ## ADDED Requirements
 
-### Requirement: PublicSurfaceRuleCodesAndSuggestedBump
-
-Every breaking-change classification produced by `certify_public_surface` SHALL carry a stable
-rule code from a closed, documented set, in addition to its human-readable reasons. Breaking-classed
-rule codes SHALL be registered in `FINDING_CODE_REGISTRY` with source-declared default class
-`advisory`, so an operator's `enforcement.policy` can gate individual rules and `openlore enforce`
-can govern them. The diff verdict SHALL include a computed `suggestedBump` — `major` when any
-change is `breaking`, else `minor` when any export was added, else `patch` — as a total function
-of the existing classification, with no new tuning constant. The `potentially-breaking` class
-SHALL keep its meaning ("cannot be confirmed programmatically") and SHALL never be silently
-escalated to a breaking-classed code.
-
-#### Scenario: A removed export carries its rule code
-
-- **GIVEN** a diff that removes an exported symbol
-- **WHEN** `certify_public_surface` classifies the diff
-- **THEN** the change carries `ruleCode: export-removed` alongside its prose reason, and a
-  governance finding with that code is available to the enforcement gate
-
-#### Scenario: Per-rule gating
-
-- **GIVEN** an `enforcement.policy` mapping `export-removed` to `blocking` and nothing else
-- **WHEN** a diff both removes an export and narrows a parameter type
-- **THEN** only the `export-removed` finding resolves to blocking; `param-type-narrowed` stays
-  advisory
-
-#### Scenario: Suggested bump is computed, not guessed
-
-- **GIVEN** a diff whose only surface change is a newly added export
-- **WHEN** the verdict is assembled
-- **THEN** `suggestedBump` is `minor`, and a diff with any breaking change yields `major`
-
 ### Requirement: AcceptedBreakageBaselineRequiresJustification
 
 The system SHALL support recording intentionally accepted breaking changes in a checked-in,

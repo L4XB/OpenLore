@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  suggestedBump,
   parseSignature,
   compareTypes,
   classifySignatureChange,
@@ -176,7 +177,7 @@ describe('classifySignatureChange', () => {
 
 describe('overallClass', () => {
   const mk = (cls: SurfaceChange['class']): SurfaceChange =>
-    ({ changeKind: 'signature', class: cls, name: 'x', file: 'a.ts', kind: 'function', reasons: [] });
+    ({ changeKind: 'signature', class: cls, name: 'x', file: 'a.ts', kind: 'function', reasons: [], ruleCodes: [] });
   it('breaking dominates', () => {
     expect(overallClass([mk('non-breaking'), mk('potentially-breaking'), mk('breaking')])).toBe('breaking');
   });
@@ -198,3 +199,43 @@ describe('signatureClassifiable', () => {
     expect(signatureClassifiable('Go')).toBe(false);
   });
 });
+
+describe('rule codes and suggested bump (refine-public-surface-certification)', () => {
+  const cases: Array<[string, string, string, string[]]> = [
+    ['removed parameter', 'function f(a: number, b: string): void', 'function f(a: number): void', ['param-removed']],
+    ['required parameter added', 'function f(a: number): void', 'function f(a: number, b: string): void', ['param-required-added']],
+    ['parameter became required', 'function f(a?: number): void', 'function f(a: number): void', ['param-became-required']],
+    ['parameter type narrowed', 'function f(a: string | number): void', 'function f(a: string): void', ['param-type-narrowed']],
+    ['return type narrowed', 'function f(): string | number', 'function f(): string', ['return-type-narrowed']],
+    ['incomparable type change', 'function f(a: string): void', 'function f(a: boolean): void', ['signature-unprovable']],
+    ['optional parameter added', 'function f(a: number): void', 'function f(a: number, b?: string): void', []],
+  ];
+  it.each(cases)('%s carries its rule code', (_label, before, after, codes) => {
+    expect(classifySignatureChange(before, after, 'TypeScript').ruleCodes).toEqual(codes);
+  });
+
+  it.each([
+    ['untyped parameter', 'function f(a: string): void', 'function f(a): void', 'TypeScript'],
+    ['untyped return', 'function f(): string', 'function f()', 'TypeScript'],
+    ['incomparable return', 'function f(): string', 'function f(): boolean', 'TypeScript'],
+    ['unparsed signature', 'function f(a: string): void', 'const f = 1', 'TypeScript'],
+    ['non-classifiable language', 'func F(a string)', 'func F(a int)', 'Go'],
+  ])('%s is potentially-breaking with exactly signature-unprovable', (_label, before, after, language) => {
+    const r = classifySignatureChange(before, after, language);
+    expect(r.class).toBe('potentially-breaking');
+    expect(r.ruleCodes).toEqual(['signature-unprovable']);
+  });
+
+  const mk = (cls: SurfaceChange['class'], changeKind: SurfaceChange['changeKind'] = 'signature'): SurfaceChange =>
+    ({ changeKind, class: cls, name: 'x', file: 'a.ts', kind: 'function', reasons: [], ruleCodes: [] });
+  it('suggestedBump: breaking → major, unproven → withheld, added export → minor, otherwise patch', () => {
+    expect(suggestedBump([mk('breaking'), mk('potentially-breaking')])).toBe('major');
+    expect(suggestedBump([mk('non-breaking', 'added'), mk('potentially-breaking')])).toBeNull();
+    expect(suggestedBump([mk('potentially-breaking'), mk('non-breaking')])).toBeNull();
+    expect(suggestedBump([mk('non-breaking', 'added')], false)).toBeNull();
+    expect(suggestedBump([mk('non-breaking', 'added')])).toBe('minor');
+    expect(suggestedBump([mk('non-breaking')])).toBe('patch');
+    expect(suggestedBump([])).toBe('patch');
+  });
+});
+
