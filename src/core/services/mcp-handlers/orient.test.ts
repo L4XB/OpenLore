@@ -892,4 +892,125 @@ describe('handleOrient', () => {
     expect(fooPaths!.callees.some(c => c.name === 'fetch')).toBe(false);
     expect(fooPaths!.callees.some(c => c.name === 'doBar')).toBe(true);
   });
+
+  // change: refine-orient-context-budgeting
+  describe('whole-payload token budget', () => {
+    const results = (count: number) => Array.from({ length: count }, (_, i) =>
+      makeSearchResult({ name: `handler${String(i).padStart(2, '0')}`, filePath: `src/module${i}.ts` }));
+    const served = (value: unknown) => {
+      const text = JSON.stringify(value, null, 2);
+      const code = (text.match(/[{}()[\];:,.<>/\\|`~!@#$%^&*=+]/g) || []).length;
+      return Math.ceil((text.length - code) / 4 + code / 2);
+    };
+    type Receipt = { tokenBudget: number; estimatedTokens: number; fits: boolean; omitted?: Record<string, number>; addedBeyondLimit?: number };
+    type Payload = Record<string, unknown> & { budget: Receipt };
+    const sections = (payload: Record<string, unknown>) => Object.fromEntries(Object.entries(payload)
+      // The staleness note cites the files in the answer, so it follows the added functions.
+      .filter(([key]) => !['relevantFunctions', 'callPaths', 'relevantFiles', 'budget', 'relevantFunctionsOmitted', 'indexStaleness'].includes(key)));
+
+    beforeEach(() => {
+      vi.mocked(VectorIndex.exists).mockReturnValue(true);
+      vi.mocked(VectorIndex.search).mockResolvedValue(results(30));
+    });
+
+    it('leaves the payload and search width unchanged when no budget is passed', async () => {
+      const plain = await handleOrient('/tmp/proj', 'handler', 5) as Record<string, unknown>;
+      expect(plain.budget).toBeUndefined();
+      expect((plain.relevantFunctions as unknown[]).length).toBe(5);
+      expect(vi.mocked(VectorIndex.search).mock.calls.at(-1)?.[3]).toMatchObject({ limit: 15 });
+    });
+
+    it('never returns less than the default answer when the budget covers it, and adds ranked functions past limit', async () => {
+      const plain = await handleOrient('/tmp/proj', 'handler', 5) as Record<string, unknown>;
+      const budget = served(plain) + 400;
+      const wide = await handleOrient('/tmp/proj', 'handler', 5, budget) as Payload;
+      expect(wide.budget.fits).toBe(true);
+      expect(wide.budget.estimatedTokens).toBeLessThanOrEqual(budget);
+      expect(served(wide)).toBe(wide.budget.estimatedTokens);
+      // Every non-function section is exactly the default answer's.
+      expect(sections(wide)).toEqual(sections(plain));
+      const fns = wide.relevantFunctions as Array<{ name: string; filePath: string }>;
+      expect(fns.slice(0, 5)).toEqual(plain.relevantFunctions);
+      expect(fns.length).toBe(5 + (wide.budget.addedBeyondLimit ?? 0));
+      expect(wide.budget.addedBeyondLimit).toBeGreaterThan(0);
+      expect((wide.callPaths as Array<{ function: string }>).map(p => p.function)).toEqual(fns.map(f => f.name));
+      expect(vi.mocked(VectorIndex.search).mock.calls.at(-1)?.[3]).toMatchObject({ limit: 60 });
+    });
+
+    it('adds the whole pool when the budget allows', async () => {
+      vi.mocked(VectorIndex.search).mockResolvedValue(results(40));
+      const all = await handleOrient('/tmp/proj', 'handler', 5, 1_000_000) as Payload;
+      expect((all.relevantFunctions as unknown[]).length).toBe(40);
+      expect(all.budget).toMatchObject({ fits: true, addedBeyondLimit: 35 });
+    });
+
+    it('trims a too-large default answer peripheral first, whole entries only, with a receipt', async () => {
+      const plain = await handleOrient('/tmp/proj', 'handler', 5) as Record<string, unknown>;
+      const plainFns = plain.relevantFunctions as Array<{ name: string }>;
+      const budget = served(plain) - 150;
+      const fitted = await handleOrient('/tmp/proj', 'handler', 5, budget) as Payload;
+      expect(fitted.budget.fits).toBe(true);
+      expect(fitted.budget.estimatedTokens).toBeLessThanOrEqual(budget);
+      expect(served(fitted)).toBe(fitted.budget.estimatedTokens);
+      expect(fitted.budget.omitted?.insertionPoints).toBeGreaterThan(0);
+      const kept = fitted.relevantFunctions as Array<{ name: string }>;
+      expect(kept.map(f => f.name)).toEqual(plainFns.slice(0, kept.length).map(f => f.name));
+      expect((fitted.callPaths as Array<{ function: string }>).map(p => p.function)).toEqual(kept.map(f => f.name));
+      // The file scope the other sections were computed for is unchanged.
+      expect(fitted.relevantFiles).toEqual(plain.relevantFiles);
+    });
+
+    it('keeps the default answer as is and never adds an exact duplicate of it', async () => {
+      const dup = (filePath: string) => makeSearchResult({ name: 'sharedHelper', filePath });
+      // Two same-name results in one file inside `limit`, and a duplicate of them ranked past it.
+      vi.mocked(VectorIndex.search).mockResolvedValue([
+        dup('src/a.ts'), dup('src/a.ts'), ...results(3), ...results(10).slice(3, 6), dup('src/b.ts'), ...results(10).slice(6),
+      ]);
+      const plain = await handleOrient('/tmp/proj', 'handler', 5) as Record<string, unknown>;
+      const wide = await handleOrient('/tmp/proj', 'handler', 5, 1_000_000) as Payload;
+      const fns = wide.relevantFunctions as Array<{ name: string; filePath: string }>;
+      expect(fns.slice(0, 5)).toEqual(plain.relevantFunctions);
+      expect(fns.filter(f => f.name === 'sharedHelper').map(f => f.filePath)).toEqual(['src/a.ts', 'src/a.ts']);
+      expect((wide.callPaths as unknown[]).length).toBe(fns.length);
+      expect((wide.callPaths as Array<{ function: string; filePath: string }>).map(p => `${p.function}@${p.filePath}`))
+        .toEqual(fns.map(f => `${f.name}@${f.filePath}`));
+    });
+
+    it('treats a null budget as no budget', async () => {
+      const plain = await handleOrient('/tmp/proj', 'handler', 5);
+      const nullBudget = await handleOrient('/tmp/proj', 'handler', 5, null as unknown as number);
+      expect(JSON.stringify(nullBudget)).toBe(JSON.stringify(plain));
+    });
+
+    it('never trims governance context and keeps at least one function', async () => {
+      vi.mocked(VectorIndex.search).mockResolvedValue(results(10));
+      vi.mocked(loadDecisionStore).mockResolvedValue({
+        version: '1', sessionId: 's', updatedAt: '2026-01-01T00:00:00.000Z',
+        decisions: [{
+          id: 'abcd1234', status: 'draft', title: 'Keep auth in one place', rationale: 'r', consequences: 'c',
+          proposedRequirement: null, affectedDomains: [], affectedFiles: ['src/module4.ts'], sessionId: 's',
+          recordedAt: '2026-01-01T00:00:00.000Z', confidence: 'high', syncedToSpecs: [],
+        }],
+      } as never);
+      const plain = await handleOrient('/tmp/proj', 'handler', 5) as Record<string, unknown>;
+      expect(plain.pendingDecisions).toBeDefined();
+      const tiny = await handleOrient('/tmp/proj', 'handler', 5, 10) as Payload;
+      expect(tiny.budget.fits).toBe(false);
+      expect((tiny.relevantFunctions as unknown[]).length).toBe(1);
+      expect(tiny.pendingDecisions).toEqual(plain.pendingDecisions);
+      expect(tiny.relevantFunctionsOmitted).not.toMatch(/increase limit/);
+    });
+
+    it('rejects a budget that is not a finite number of at least 1', async () => {
+      for (const budget of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(await handleOrient('/tmp/proj', 'handler', 5, budget)).toMatchObject({ error: expect.stringMatching(/tokenBudget/) });
+      }
+    });
+
+    it('is deterministic for the same task and budget', async () => {
+      const a = await handleOrient('/tmp/proj', 'handler', 5, 400);
+      const b = await handleOrient('/tmp/proj', 'handler', 5, 400);
+      expect(JSON.stringify(a)).toBe(JSON.stringify(b));
+    });
+  });
 });

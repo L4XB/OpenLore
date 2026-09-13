@@ -43,7 +43,7 @@ requirements reflected in the main specs. `openspec list` shows only open work.
 A change belongs here the moment its implementation starts; move it back out (archive it) the
 moment its marker/spec evidence lands.
 
-## To build — 100
+## To build — 99
 
 The whole open set is unbuilt backlog. Newest additions: 7 proposals from the 2026-07-27
 first-run e2e (`E2E-FIRSTRUN-2026-07-27.md`). Other thematic indexes:
@@ -169,7 +169,6 @@ trust boundary for served content.
 | `optimize-serving-hot-path-caches` | The default tools rebuild derived graph structures and re-parse multi-MB artifacts on every call, and re-scan the whole corpus per keyword search |
 | `promote-backed-language-visibility` | the generated matrix discloses its scope, the docs get one canonical page |
 | `refine-first-run-partial-serving` | minutes of "no index found" before the first answer |
-| `refine-orient-context-budgeting` | exact-fit payloads, cold-start breadth, seed-conditioned shaping |
 | `refine-public-surface-certification` | rule codes + semver bump, an accepted-breakage baseline, consumer-weighted verdicts |
 | `resolve-literal-reflective-dispatch` | recover the *structurally* decidable subset, and refuse the rest loudly |
 | `scale-analyze-to-workspace-shards` | a monorepo stops paying for the whole repo on every analyze |
@@ -244,6 +243,15 @@ heredoc bodies); variables, globs, `cd`, modules by name, PowerShell steps, and 
 reasoned boundaries. Four adversarial reviews plus a fix-verification review hardened it against false
 wiring, FIFO hangs, a YAML merge-key bomb, quadratic scans, and unbounded boundary growth. On this
 repository 36 of 1,018 entry points are config-invoked.
+
+Shipped and archived since: `refine-orient-context-budgeting` (2026-09-13, narrowed) — `orient`'s
+`tokenBudget` fits the whole response as sent: the top-`limit` answer is built exactly as without a
+budget, then functions ranked past `limit` are added with their call paths while they fit, or whole
+lowest-ranked entries are trimmed peripheral-first with the fewest removals. Decisions, memories,
+architecture violations, and matching specs are never dropped, and a `budget` receipt reports the exact
+served size. Four adversarial reviews found the first version widened the pool before fitting (a
+budget above the default returned less); two verification rounds hardened the redesign. Cold-start
+expansion, seed shaping, and `get_minimal_context` are deferred.
 
 ## Maintenance rules (what kept this table honest)
 
